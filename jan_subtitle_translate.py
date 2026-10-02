@@ -75,7 +75,7 @@ def ensure_setup(folder):
         print("[SETUP] Required runtime component missing:", exc, flush=True)
         print("[SETUP] Running automatic setup check...", flush=True)
         result = subprocess.run(
-            [str(setup), "--auto", "--data-folder", str(folder)],
+            ["bash", str(setup), "--auto", "--data-folder", str(folder)],
             check=False,
         )
         if result.returncode != 0:

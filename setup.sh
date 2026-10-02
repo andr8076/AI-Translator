@@ -47,7 +47,7 @@ fi
 
 if [[ ! -d "$DATA_FOLDER/llamacpp/models" ]]; then
     printf '[SETUP] Jan model directory not found: %s\n' "$DATA_FOLDER/llamacpp/models" >&2
-    printf '[SETUP] Set JAN_DATA_FOLDER to Jan's data directory.\n' >&2
+    printf "[SETUP] Set JAN_DATA_FOLDER to Jan's data directory.\n" >&2
     exit 2
 fi
 

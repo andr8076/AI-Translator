@@ -39,12 +39,51 @@ def find_model(folder):
             return p
     raise FileNotFoundError("TranslateGemma was not found in Jan's data folder")
 
-def find_backend(folder):
+def detect_runtime(folder):
+    """Choose the best Jan backend available on this machine."""
     base = Path(folder) / "llamacpp/backends"
-    found = sorted(base.glob("*/linux-vulkan-x64/build/bin/llama-server"), reverse=True)
-    if not found:
-        raise FileNotFoundError("Jan's Vulkan llama-server was not found")
-    return found[0]
+    has_nvidia = shutil.which("nvidia-smi") is not None
+    has_vulkan = Path("/dev/dri").exists() or shutil.which("vulkaninfo") is not None
+    preferences = [("cuda", "CUDA0")] if has_nvidia else []
+    if has_vulkan:
+        preferences.append(("vulkan", "Vulkan0"))
+    preferences.append(("cpu", None))
+    for kind, device in preferences:
+        matches = sorted(
+            base.glob("*/linux-%s*/build/bin/llama-server" % kind),
+            reverse=True,
+        )
+        if matches:
+            return matches[0], kind, device
+    raise FileNotFoundError(
+        "No Jan llama-server backend was found. Run ./setup.sh --install."
+    )
+
+def find_backend(folder):
+    return detect_runtime(folder)[0]
+
+def ensure_setup(folder):
+    """Run the separate setup helper only when required runtime pieces are absent."""
+    setup = Path(__file__).with_name("setup.sh")
+    try:
+        detect_runtime(folder)
+        find_model(folder)
+        return
+    except FileNotFoundError as exc:
+        if not setup.exists():
+            raise
+        print("[SETUP] Required runtime component missing:", exc, flush=True)
+        print("[SETUP] Running automatic setup check...", flush=True)
+        result = subprocess.run(
+            [str(setup), "--auto", "--data-folder", str(folder)],
+            check=False,
+        )
+        if result.returncode != 0:
+            raise RuntimeError(
+                "Automatic setup did not complete. Run ./setup.sh --install."
+            )
+        detect_runtime(folder)
+        find_model(folder)
 
 def free_port(preferred):
     for port in (preferred, 0):
@@ -109,13 +148,15 @@ def request(url, payload, key, timeout=180):
         return json.loads(res.read().decode())
 
 def start_server(folder, model, port, key, ctx, log_path):
-    backend = find_backend(folder)
+    backend, kind, device = detect_runtime(folder)
     env = os.environ.copy()
     env["LD_LIBRARY_PATH"] = str(backend.parent) + os.pathsep + env.get("LD_LIBRARY_PATH", "")
     cmd = [str(backend), "--host", "127.0.0.1", "--port", str(port),
            "--model", str(model), "--alias", "translategemma", "--ctx-size", str(ctx),
-           "--n-gpu-layers", "all", "--device", "Vulkan0", "--parallel", "1",
-           "--api-key", key, "--no-jinja"]
+           "--n-gpu-layers", "all" if kind != "cpu" else "0",
+           "--parallel", "1", "--api-key", key, "--no-jinja"]
+    if device:
+        cmd[cmd.index("--parallel"):cmd.index("--parallel")] = ["--device", device]
     log = open(log_path, "a", encoding="utf-8")
     proc = subprocess.Popen(cmd, stdout=log, stderr=subprocess.STDOUT,
                             env=env, start_new_session=True)
@@ -428,6 +469,7 @@ def main():
         out = src.with_name(src.stem + args.suffix + src.suffix)
 
     state_file = Path(str(out) + ".progress.json")
+    ensure_setup(args.data_folder)
     model = find_model(args.data_folder)
     key = os.environ.get("JAN_SUBTITLE_API_KEY", DEFAULT_KEY)
     port = free_port(args.port)
@@ -442,7 +484,8 @@ def main():
 
     try:
         print("Jan model:", model, flush=True)
-        print("GPU: Vulkan0 / Radeon RX 7800 XT", flush=True)
+        backend, kind, device = detect_runtime(args.data_folder)
+        print("Backend:", kind, "| device:", device or "CPU", flush=True)
         print("Loading model; first load can take about a minute...", flush=True)
         proc, log = start_server(
             args.data_folder, model, port, key, args.context_size, log_path

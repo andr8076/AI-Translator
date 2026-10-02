@@ -1,0 +1,16 @@
+1
+00:00:01,000 --> 00:00:03,000
+Mary gik hjem, fordi hun var træt.
+
+2
+00:00:04,000 --> 00:00:06,000
+Jeg ses med dig i morgen.
+
+3
+00:00:07,000 --> 00:00:09,000
+Hvor er Charles?
+TAGTOKEN
+
+4
+00:00:10,000 --> 00:00:12,000
+[MUSIK]

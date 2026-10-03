@@ -527,7 +527,7 @@ def main():
         print("Jan model:", model, flush=True)
         backend, kind, device = detect_runtime(args.data_folder)
         if args.workers == 0:
-            args.workers = 2 if kind != "cpu" else 1
+            args.workers = 3 if kind != "cpu" else 1
         print("Backend:", kind, "| device:", device or "CPU", flush=True)
         print("Parallel workers:", args.workers, flush=True)
         print("Loading model; first load can take about a minute...", flush=True)

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Resumable SRT/ZIP subtitle translation using Jan's local TranslateGemma model."""
-import argparse, json, os, re, signal, shutil, socket, subprocess, time
+import argparse, concurrent.futures, json, os, re, signal, shutil, socket, subprocess, time
 import urllib.request, zipfile
 from pathlib import Path
 
@@ -147,14 +147,14 @@ def request(url, payload, key, timeout=180):
     with urllib.request.urlopen(req, timeout=timeout) as res:
         return json.loads(res.read().decode())
 
-def start_server(folder, model, port, key, ctx, log_path):
+def start_server(folder, model, port, key, ctx, log_path, parallel=1):
     backend, kind, device = detect_runtime(folder)
     env = os.environ.copy()
     env["LD_LIBRARY_PATH"] = str(backend.parent) + os.pathsep + env.get("LD_LIBRARY_PATH", "")
     cmd = [str(backend), "--host", "127.0.0.1", "--port", str(port),
            "--model", str(model), "--alias", "translategemma", "--ctx-size", str(ctx),
            "--n-gpu-layers", "all" if kind != "cpu" else "0",
-           "--parallel", "1", "--api-key", key, "--no-jinja"]
+           "--parallel", str(max(1, parallel)), "--api-key", key, "--no-jinja"]
     if device:
         cmd[cmd.index("--parallel"):cmd.index("--parallel")] = ["--device", device]
     log = open(log_path, "a", encoding="utf-8")
@@ -252,11 +252,11 @@ def translate_chunk(api, key, cues, source, target, before=(), after=()):
         "%s"
         "<end_of_turn>\n<start_of_turn>model\n"
     ) % (source, target, source_text)
-    payload = {"prompt": prompt, "n_predict": min(4096, max(512, len(source_text) // 2)),
-               "temperature": 0.15, "top_p": 0.9,
+    payload = {"prompt": prompt, "n_predict": min(4096, max(384, len(source_text) // 2)),
+               "temperature": 0.05, "top_p": 0.9, "cache_prompt": True,
                "stop": ["<end_of_turn>", "<start_of_turn>"]}
     last = ""
-    for attempt in range(3):
+    for attempt in range(2):
         try:
             out = request(api + "/completion", payload, key)["content"].strip()
             out = out.replace(chr(96) * 3 + "text", "").replace(chr(96) * 3, "").strip()
@@ -267,10 +267,13 @@ def translate_chunk(api, key, cues, source, target, before=(), after=()):
                 return [dict(c, body=translated[i].split("\n")) for i, c in enumerate(cues)]
             missing = sorted(expected - set(translated))[:12]
             last = "missing or reordered cue markers; returned %d/%d; missing %s" % (len(translated), len(expected), missing)
+            # A malformed structured response is usually reproducible. Split immediately
+            # instead of wasting two more full generations of the same large block.
+            break
         except Exception as exc:
             last = str(exc)
-        payload["temperature"] = 0.05
-        time.sleep(attempt + 1)
+            if attempt == 0:
+                time.sleep(1)
     raise RuntimeError("Context translation failed: " + last)
 
 
@@ -294,7 +297,7 @@ def translate_resilient(api, key, cues, source, target, before=(), after=()):
 
 
 def translate_srt(raw, start, limit, api, source, target, state,
-                label="subtitle", verbose=True, block_cues=32):
+                label="subtitle", verbose=True, block_cues=16, workers=1):
     cues, newline = parse_srt(raw.decode("utf-8-sig"))
     state["cue_total"] = len(cues)
     if verbose:
@@ -305,10 +308,14 @@ def translate_srt(raw, start, limit, api, source, target, state,
         print("[SKIP] Already Danish:", label, flush=True)
         return raw, 0
     state.pop("skipped_danish", None)
-    done = 0
+
     max_end = len(cues)
     if limit:
         max_end = min(max_end, start + limit)
+
+    # Build independent translation blocks up front. Context is deliberately taken
+    # from the original subtitle text, so multiple blocks can safely run in parallel.
+    blocks = []
     pos = start
     while pos < max_end:
         end = pos
@@ -316,24 +323,54 @@ def translate_srt(raw, start, limit, api, source, target, state,
         while end < max_end and (
             end == pos or (
                 end - pos < block_cues and
-                chars + len("\n".join(cues[end]["body"])) <= 4000
+                chars + len("\n".join(cues[end]["body"])) <= 3000
             )
         ):
             chars += len("\n".join(cues[end]["body"]))
             end += 1
-        block_start = pos
-        before = cues[max(0, pos - 8):pos]
-        after = cues[end:min(len(cues), end + 8)]
-        translated = translate_resilient(
-            api, state["key"], cues[pos:end], source, target, before, after
-        )
-        cues[pos:end] = translated
-        done += end - pos
+        before = list(cues[max(0, pos - 8):pos])
+        after = list(cues[end:min(len(cues), end + 8)])
+        blocks.append((pos, end, list(cues[pos:end]), before, after))
         pos = end
-        state["next_cue"] = pos
-        if verbose:
-            print("  [BLOCK]", label, "cues", block_start + 1, "-", pos,
-                  "/", len(cues), "| translated", done, flush=True)
+
+    done = 0
+    workers = max(1, int(workers))
+    if verbose:
+        print("[PERF]", len(blocks), "blocks |", workers,
+              "parallel worker" + ("" if workers == 1 else "s"), flush=True)
+
+    started = time.time()
+    with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as pool:
+        futures = [
+            pool.submit(
+                translate_resilient, api, state["key"], block, source, target,
+                before, after
+            )
+            for _, _, block, before, after in blocks
+        ]
+        # Consume in subtitle order so progress/resume position remains contiguous,
+        # while llama-server continues working on later requests in parallel.
+        for number, ((block_start, block_end, _, _, _), future) in enumerate(
+                zip(blocks, futures), 1):
+            block_started = time.time()
+            translated = future.result()
+            cues[block_start:block_end] = translated
+            done += block_end - block_start
+            state["next_cue"] = block_end
+            if verbose:
+                elapsed = time.time() - started
+                rate = done / elapsed if elapsed > 0 else 0
+                print(
+                    "  [BLOCK %d/%d] %s cues %d-%d / %d | %.1f cues/s" %
+                    (number, len(blocks), label, block_start + 1, block_end,
+                     len(cues), rate),
+                    flush=True,
+                )
+
+    if verbose and done:
+        elapsed = time.time() - started
+        print("[PERF]", label, "|", done, "cues in %.1fs | %.2f cues/s" %
+              (elapsed, done / max(elapsed, 0.001)), flush=True)
     return render_srt(cues, newline).encode("utf-8"), done
 
 def write_state(path, state):
@@ -370,7 +407,7 @@ def process_srt_file(src, out, args, api, key, label=None):
     translated, count = translate_srt(
         raw, state["next_cue"], args.limit, api,
         args.source_language, args.target_language, state,
-        label or str(src), not args.quiet, args.block_cues
+        label or str(src), not args.quiet, args.block_cues, args.workers
     )
     state["translated"] += count
     out.parent.mkdir(parents=True, exist_ok=True)
@@ -432,8 +469,10 @@ def main():
                         default=os.environ.get("JAN_DATA_FOLDER", DEFAULT_DATA))
     parser.add_argument("--limit", type=int, default=0,
                         help="Maximum cues per file (0 = all)")
-    parser.add_argument("--block-cues", type=int, default=32,
-                        help="Target cues per model request (default: 32; lower if needed)")
+    parser.add_argument("--block-cues", type=int, default=16,
+                        help="Target cues per model request (default: 16; smaller blocks avoid costly retries)")
+    parser.add_argument("--workers", type=int, default=0,
+                        help="Parallel model requests (0 = auto: 2 on GPU, 1 on CPU)")
     parser.add_argument("--fresh", action="store_true",
                         help="Ignore existing progress and output")
     parser.add_argument("--quiet", action="store_true",
@@ -448,6 +487,8 @@ def main():
     args = parser.parse_args()
     if args.block_cues < 1:
         parser.error("--block-cues must be at least 1")
+    if args.workers < 0:
+        parser.error("--workers cannot be negative")
 
     if args.suffix and not args.suffix.startswith(("_", "-", ".")):
         args.suffix = "_" + args.suffix
@@ -485,10 +526,14 @@ def main():
     try:
         print("Jan model:", model, flush=True)
         backend, kind, device = detect_runtime(args.data_folder)
+        if args.workers == 0:
+            args.workers = 2 if kind != "cpu" else 1
         print("Backend:", kind, "| device:", device or "CPU", flush=True)
+        print("Parallel workers:", args.workers, flush=True)
         print("Loading model; first load can take about a minute...", flush=True)
         proc, log = start_server(
-            args.data_folder, model, port, key, args.context_size, log_path
+            args.data_folder, model, port, key, args.context_size, log_path,
+            args.workers
         )
         api = "http://127.0.0.1:%d" % port
         state = {
@@ -525,7 +570,8 @@ def main():
                 payloads[entry], count = translate_srt(
                     payloads[entry], state["next_cue"], args.limit, api,
                     args.source_language, args.target_language, state,
-                    infos[entry].filename, not args.quiet, args.block_cues
+                    infos[entry].filename, not args.quiet, args.block_cues,
+                    args.workers
                 )
                 state["translated"] += count
                 complete = state["next_cue"] >= state["cue_total"]

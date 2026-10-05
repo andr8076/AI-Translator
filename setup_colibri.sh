@@ -96,6 +96,7 @@ install_model() {
         "$RUNTIME_DIR/c/tools/convert_olmoe_merged.py" \
         --repo "$MODEL_REPO" \
         --out "$MODEL_DIR" \
+        --flush-every 64 \
         --min-free-gb 10
 }
 

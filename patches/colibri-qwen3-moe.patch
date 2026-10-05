@@ -1,0 +1,389 @@
+diff --git a/c/family_registry.py b/c/family_registry.py
+index d1fb387..b43b8c0 100644
+--- a/c/family_registry.py
++++ b/c/family_registry.py
+@@ -230,16 +230,22 @@ def _qwen36_geometry(config, context, _model_dir):
+     layers = _required_int(config, "num_hidden_layers", "qwen36")
+     kinds = _qwen36_layer_types(config, layers, _model_dir)
+     full = sum(kind == "full_attention" for kind in kinds)
++    q_heads = _required_int(config, "num_attention_heads", "qwen36")
++    hidden = _required_int(config, "hidden_size", "qwen36")
++    head_dim = _optional_int(config, "head_dim", hidden // q_heads, 1)
+     kv = (full * context * _required_int(config, "num_key_value_heads", "qwen36") *
+-          _required_int(config, "head_dim", "qwen36") * 2 * 4)
+-    key_heads = _required_int(config, "linear_num_key_heads", "qwen36")
+-    key_dim = _required_int(config, "linear_key_head_dim", "qwen36")
+-    value_heads = _required_int(config, "linear_num_value_heads", "qwen36")
+-    value_dim = _required_int(config, "linear_value_head_dim", "qwen36")
+-    conv_k = _required_int(config, "linear_conv_kernel_dim", "qwen36", 2)
+-    conv_dim = key_heads * key_dim * 2 + value_heads * value_dim
+-    fixed = (layers - full) * (value_heads * key_dim * value_dim +
+-                               conv_dim * (conv_k - 1)) * 4
++          head_dim * 2 * 4)
++    if full == layers:
++        fixed = 0
++    else:
++        key_heads = _required_int(config, "linear_num_key_heads", "qwen36")
++        key_dim = _required_int(config, "linear_key_head_dim", "qwen36")
++        value_heads = _required_int(config, "linear_num_value_heads", "qwen36")
++        value_dim = _required_int(config, "linear_value_head_dim", "qwen36")
++        conv_k = _required_int(config, "linear_conv_kernel_dim", "qwen36", 2)
++        conv_dim = key_heads * key_dim * 2 + value_heads * value_dim
++        fixed = (layers - full) * (value_heads * key_dim * value_dim +
++                                   conv_dim * (conv_k - 1)) * 4
+     return PlannerGeometry(kv, fixed, 0, _required_int(config, "num_experts", "qwen36"))
+ 
+ 
+@@ -1288,7 +1294,7 @@ FAMILIES = (
+     ),
+     FamilyDescriptor(
+         id="qwen36",
+-        model_types=("qwen3_5_moe", "qwen3_5_moe_text"),
++        model_types=("qwen3_5_moe", "qwen3_5_moe_text", "qwen3_moe"),
+         display_name="Qwen3.6-35B-A3B",
+         display_scale="35B",
+         # Both checkpoints declare qwen3_5_moe_text. Keyed on the three
+@@ -1301,6 +1307,9 @@ FAMILIES = (
+             DisplayVariant((("num_hidden_layers", 92), ("num_experts", 512),
+                             ("hidden_size", 8192)),
+                            "Qwen3.8-2.4T-A95B", "2.4T"),
++            DisplayVariant((("num_hidden_layers", 48), ("num_experts", 128),
++                            ("hidden_size", 2048)),
++                           "Qwen3-30B-A3B", "30B"),
+         ),
+         engine_artifact="qwen36",
+         engine_aliases=(),
+diff --git a/c/qwen36.c b/c/qwen36.c
+index e751501..5eca0b3 100644
+--- a/c/qwen36.c
++++ b/c/qwen36.c
+@@ -679,7 +679,7 @@ typedef struct {
+     int n_experts, topk, inter, shared_inter, vocab;
+     int n_group, topk_group;
+     float theta, eps, partial_rotary_factor;
+-    int norm_topk, has_qk_norm, has_bias, attn_output_gate;
++    int norm_topk, has_qk_norm, has_bias, attn_output_gate, rms_add_one;
+     uint8_t *is_attn;   /* [n_layers] 1 if Gated Attention layer, 0 if DeltaNet */
+     /* Gated DeltaNet (linear_attention) dims, read from qwen36_meta.json. */
+     int dn_vheads, dn_kheads, dn_kdim, dn_vdim, dn_convk, dn_conv_dim;
+@@ -1282,10 +1282,10 @@ static int qdw_place(const QW *w, int dev){
+ 
+ /* rmsnorm over a row of length D (in-place capable: out may == x).
+  * Qwen3_5MoeRMSNorm: out = (x * rsqrt(mean(x^2)+eps)) * (1.0 + weight). */
+-static void rmsnorm_row(float *out, const float *x, const float *w, int D, float eps) {
++static void rmsnorm_row(float *out, const float *x, const float *w, int D, float eps, int add_one) {
+     double ms = 0; for (int i = 0; i < D; i++) ms += (double)x[i]*x[i];
+     float r = 1.f / sqrtf((float)(ms / D) + eps);
+-    for (int i = 0; i < D; i++) out[i] = x[i] * r * (1.0f + w[i]);
++    for (int i = 0; i < D; i++) out[i] = x[i] * r * (add_one ? (1.0f + w[i]) : w[i]);
+ }
+ 
+ static void softmax_row(float *x, int n) {
+@@ -1332,7 +1332,7 @@ static void load_cfg(Cfg *c, const char *snap) {
+     c->partial_rotary_factor = 0.25f;
+     c->n_experts = 256; c->topk = 8; c->inter = 512; c->shared_inter = 512;
+     c->n_group = 1; c->topk_group = 1; c->norm_topk = 1; c->has_qk_norm = 1; c->has_bias = 0;
+-    c->attn_output_gate = 1; c->n_active = 0;
++    c->attn_output_gate = 1; c->rms_add_one = 1; c->n_active = 0;
+     if (c->n_layers <= 0 || c->n_layers > 512) { fprintf(stderr, "load_cfg: n_layers=%d out of range 1..512\n", c->n_layers); exit(1); }
+     c->is_attn = calloc((size_t)c->n_layers, sizeof(uint8_t));
+     for (int i = 0; i < c->n_layers; i++) c->is_attn[i] = (i % 4 == 3) ? 1 : 0;
+@@ -1374,8 +1374,9 @@ static void validate_cfg(const Cfg *c, int n_layers_from_config) {
+              "topk %d out of range 1..256 (idx[]/val[] in moe())", c->topk);
+     CFG_NEED(c->topk <= c->n_experts, "topk %d exceeds num_experts %d",
+              c->topk, c->n_experts);
+-    CFG_NEED(c->inter > 0 && c->shared_inter > 0,
+-             "moe_inter %d / shared_inter %d must be positive", c->inter, c->shared_inter);
++    CFG_NEED(c->inter > 0 && c->shared_inter >= 0,
++             "moe_inter %d must be positive / shared_inter %d must be non-negative",
++             c->inter, c->shared_inter);
+     CFG_NEED(c->q_heads > 0 && c->kv_heads > 0 && c->head_dim > 0,
+              "attention dims q_heads=%d kv_heads=%d head_dim=%d must be positive",
+              c->q_heads, c->kv_heads, c->head_dim);
+@@ -1445,6 +1446,7 @@ static void load_meta(Cfg *c, const char *snap) {
+         if((v=json_get(r,"rope_theta"))&&v->t==J_NUM) c->theta=(float)v->num;
+         if((v=json_get(r,"rms_eps"))&&v->t==J_NUM) c->eps=(float)v->num;
+         if((v=json_get(r,"attn_output_gate"))&&v->t==J_BOOL) c->attn_output_gate=v->boolean;
++        if((v=json_get(r,"rms_add_one"))&&v->t==J_BOOL) c->rms_add_one=v->boolean;
+         if((v=json_get(r,"norm_topk_prob"))&&v->t==J_BOOL) c->norm_topk=v->boolean;
+         if((v=json_get(r,"has_bias"))&&v->t==J_BOOL) c->has_bias=v->boolean;
+         if((v=json_get(r,"has_qk_norm"))&&v->t==J_BOOL) c->has_qk_norm=v->boolean;
+@@ -1586,16 +1588,20 @@ static void model_init_range(Model *m, const char *snap, int cap, int bits,
+         snprintf(nm,sizeof(nm),"model.layers.%d.mlp.gate.e_score_correction_bias", ai);
+         if (st_has(&m->S, nm)) { l->gate_bias = falloc(c->n_experts); st_read_f32(&m->S, nm, l->gate_bias, 0); }
+         else l->gate_bias = NULL;
+-        /* shared expert (dense, int8-during-load) */
+-        snprintf(nm,sizeof(nm),"model.layers.%d.mlp.shared_expert.gate_proj.weight", ai);
+-        load_tq(m, nm, c->hidden, c->shared_inter, quantize_dense, "shexp", &l->sh_g); QCOUNT(l->sh_g);
+-        snprintf(nm,sizeof(nm),"model.layers.%d.mlp.shared_expert.up_proj.weight", ai);
+-        load_tq(m, nm, c->hidden, c->shared_inter, quantize_dense, "shexp", &l->sh_u); QCOUNT(l->sh_u);
+-        snprintf(nm,sizeof(nm),"model.layers.%d.mlp.shared_expert.down_proj.weight", ai);
+-        load_tq(m, nm, c->shared_inter, c->hidden, quantize_dense, "shexp", &l->sh_d); QCOUNT(l->sh_d);
+-        /* shared_expert_gate: Linear(hidden -> 1), sigmoid-gated shared expert */
+-        snprintf(nm,sizeof(nm),"model.layers.%d.mlp.shared_expert_gate.weight", ai);
+-        l->sh_gate = st_has(&m->S, nm) ? load_t_n(m, nm, c->hidden) : NULL;
++        /* Qwen3.5/3.6 has a shared expert; standard Qwen3-MoE does not. */
++        if (c->shared_inter > 0) {
++            snprintf(nm,sizeof(nm),"model.layers.%d.mlp.shared_expert.gate_proj.weight", ai);
++            load_tq(m, nm, c->hidden, c->shared_inter, quantize_dense, "shexp", &l->sh_g); QCOUNT(l->sh_g);
++            snprintf(nm,sizeof(nm),"model.layers.%d.mlp.shared_expert.up_proj.weight", ai);
++            load_tq(m, nm, c->hidden, c->shared_inter, quantize_dense, "shexp", &l->sh_u); QCOUNT(l->sh_u);
++            snprintf(nm,sizeof(nm),"model.layers.%d.mlp.shared_expert.down_proj.weight", ai);
++            load_tq(m, nm, c->shared_inter, c->hidden, quantize_dense, "shexp", &l->sh_d); QCOUNT(l->sh_d);
++            snprintf(nm,sizeof(nm),"model.layers.%d.mlp.shared_expert_gate.weight", ai);
++            l->sh_gate = st_has(&m->S, nm) ? load_t_n(m, nm, c->hidden) : NULL;
++        } else {
++            l->sh_g = l->sh_u = l->sh_d = (QW){0};
++            l->sh_gate = NULL;
++        }
+         if (c->is_attn[i]) {
+             /* Gated Attention (full_attention) layer, dense projections int8-during-load */
+             snprintf(nm,sizeof(nm),"model.layers.%d.self_attn.q_proj.weight", ai);
+@@ -2113,12 +2119,12 @@ static void attention(Model *m, Layer *l, int layer, float *x, int S, int pos_ba
+     for (int s = 0; s < S; s++) {
+         for (int hh = 0; hh < H; hh++) {
+             float *qh = query + ((int64_t)s*H + hh)*hd;
+-            if (l->qn) rmsnorm_row(qh, qh, l->qn, hd, c->eps);
++            if (l->qn) rmsnorm_row(qh, qh, l->qn, hd, c->eps, c->rms_add_one);
+             rope_head_partial(qh, pos_base + s, rotary, hd, c->theta);
+         }
+         for (int kvh = 0; kvh < KV; kvh++) {
+             float *kh = k + (int64_t)s*KV*kvd + kvh*kvd;
+-            if (l->kn) rmsnorm_row(kh, kh, l->kn, kvd, c->eps);
++            if (l->kn) rmsnorm_row(kh, kh, l->kn, kvd, c->eps, c->rms_add_one);
+             rope_head_partial(kh, pos_base + s, rotary, kvd, c->theta);
+         }
+     }
+@@ -2158,8 +2164,12 @@ static void attention(Model *m, Layer *l, int layer, float *x, int S, int pos_ba
+     float *ag = falloc((int64_t)S*H*hd);
+     for (int s = 0; s < S; s++) for (int hh = 0; hh < H; hh++) for (int dd = 0; dd < hd; dd++) {
+         int o = ((int64_t)s*H + hh)*hd + dd;
+-        float g = gate_dim ? gate[o] : 0.f;
+-        ag[o] = ctx[o] * (1.f / (1.f + expf(-g)));
++        if (gate_dim) {
++            float g = gate[o];
++            ag[o] = ctx[o] * (1.f / (1.f + expf(-g)));
++        } else {
++            ag[o] = ctx[o];
++        }
+     }
+     if (!qtd_batch(l->qth_o, out, ag, S, H*hd, D)) matmul_d(out, ag, &l->o, S, H*hd, D);
+     free(q); free(k); free(vv); free(query); free(gate); free(ctx); free(ag);
+@@ -2189,6 +2199,7 @@ static int qwen_shared_batch_rows(int S, int D, int I) {
+ static void qwen_shared_experts_cpu(Model *m, Layer *l, const float *x, int S,
+                                     float *out, float *g, float *u, float *hh) {
+     Cfg *c=&m->c; int D=c->hidden, I=c->shared_inter;
++    if (I <= 0) return;
+     int B=qwen_shared_batch_rows(S,D,I);
+     double _ts=tm_now();
+     if (B == 1) {
+@@ -2381,7 +2392,8 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out) {
+     }
+     memset(out, 0, (int64_t)S*D*sizeof(float));
+     float *g = falloc(I), *u = falloc(I), *hh = falloc(D);
+-    float *sh = falloc(I), *shu = falloc(I), *shd = falloc(D);  /* shared expert scratch */
++    int SI = c->shared_inter > 0 ? c->shared_inter : 1;
++    float *sh = falloc(SI), *shu = falloc(SI), *shd = falloc(D);  /* shared expert scratch */
+     int use_qt = qt_ready();
+     int use_xf = !use_qt && xf_mode(m);
+     int *xidx = use_xf ? malloc(sizeof(int) * (size_t)S * K) : NULL;
+@@ -2476,7 +2488,7 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out) {
+             }
+             /* Compute the shared expert NOW so it overlaps with the GPU
+              * groups; the common block below is skipped. */
+-            {
++            if (c->shared_inter > 0) {
+                 double _ts2 = tm_now();
+                 int Ish = c->shared_inter;
+                 if (!qtd(l->qth_shg, sh, xs, D, Ish))  matmul_d(sh, xs, &l->sh_g, 1, D, Ish);
+@@ -2520,7 +2532,7 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out) {
+     /* The CUDA tier keeps its per-token shared block above because it overlaps
+      * resident GPU experts.  CPU prefill instead traverses each shared matrix
+      * once per bounded chunk. */
+-    if (!use_qt) qwen_shared_experts_cpu(m,l,x,S,out,sh,shu,shd);
++    if (!use_qt && c->shared_inter > 0) qwen_shared_experts_cpu(m,l,x,S,out,sh,shu,shd);
+     free(logits); free(g); free(u); free(hh); free(sh); free(shu); free(shd);
+ }
+ 
+@@ -2736,10 +2748,12 @@ static void trunk_offer_dense(Model *m){
+         size_t bq = qdw_bytes(&l->q), bk = qdw_bytes(&l->k), bv = qdw_bytes(&l->v), bo = qdw_bytes(&l->o);
+         if (bq && bk && bv && bo) qt_trunk_offer("attnproj", i, bq + bk + bv + bo);
+     }
+-    for (int i = 0; i < c->n_layers; i++) {
+-        Layer *l = &m->L[i];
+-        size_t bg = qdw_bytes(&l->sh_g), bu = qdw_bytes(&l->sh_u), bd = qdw_bytes(&l->sh_d);
+-        if (bg && bu && bd) qt_trunk_offer("shexp", i, bg + bu + bd);
++    if (c->shared_inter > 0) {
++        for (int i = 0; i < c->n_layers; i++) {
++            Layer *l = &m->L[i];
++            size_t bg = qdw_bytes(&l->sh_g), bu = qdw_bytes(&l->sh_u), bd = qdw_bytes(&l->sh_d);
++            if (bg && bu && bd) qt_trunk_offer("shexp", i, bg + bu + bd);
++        }
+     }
+ }
+ /* After qt_init decided: upload what was placed, keep the handles in the
+@@ -2762,11 +2776,13 @@ static int trunk_place_dense(Model *m, double *vram_bytes){
+             if (l->qth_v) { placed++; vram += (double)qdw_bytes(&l->v); }
+             if (l->qth_o) { placed++; vram += (double)qdw_bytes(&l->o); }
+         }
+-        int dev = qt_place_of("shexp", i);
+-        l->qth_shg = qdw_place(&l->sh_g, dev); l->qth_shu = qdw_place(&l->sh_u, dev); l->qth_shd = qdw_place(&l->sh_d, dev);
+-        if (l->qth_shg) { placed++; vram += (double)qdw_bytes(&l->sh_g); }
+-        if (l->qth_shu) { placed++; vram += (double)qdw_bytes(&l->sh_u); }
+-        if (l->qth_shd) { placed++; vram += (double)qdw_bytes(&l->sh_d); }
++        if (c->shared_inter > 0) {
++            int dev = qt_place_of("shexp", i);
++            l->qth_shg = qdw_place(&l->sh_g, dev); l->qth_shu = qdw_place(&l->sh_u, dev); l->qth_shd = qdw_place(&l->sh_d, dev);
++            if (l->qth_shg) { placed++; vram += (double)qdw_bytes(&l->sh_g); }
++            if (l->qth_shu) { placed++; vram += (double)qdw_bytes(&l->sh_u); }
++            if (l->qth_shd) { placed++; vram += (double)qdw_bytes(&l->sh_d); }
++        }
+     }
+     if (vram_bytes) *vram_bytes = vram;
+     return placed;
+@@ -2830,7 +2846,7 @@ static void layers_forward_range(Model *m, float *x, int S, int pos_base,
+     float *nrm = falloc((int64_t)S*D), *tmp = falloc((int64_t)S*D);
+     for (int i = layer_begin; i < layer_end; i++) {
+         Layer *l = &m->L[i];
+-        for (int s = 0; s < S; s++) rmsnorm_row(nrm + (int64_t)s*D, x + (int64_t)s*D, l->in_ln, D, c->eps);
++        for (int s = 0; s < S; s++) rmsnorm_row(nrm + (int64_t)s*D, x + (int64_t)s*D, l->in_ln, D, c->eps, c->rms_add_one);
+         double _t0 = tm_now();
+         if (c->is_attn[i]) {
+             attention(m, l, i, nrm, S, pos_base, tmp);
+@@ -2844,7 +2860,7 @@ static void layers_forward_range(Model *m, float *x, int S, int pos_base,
+         if (lf) fwrite(x + (int64_t)(S-1)*D, sizeof(float), D, lf);   /* post-deltanet residual */
+         if (allow_prefetch && g_pilot >= 1 && S <= 8 && i + 1 < c->n_layers)
+             pilot_prefetch(m, i + 1, x, S);
+-        for (int s = 0; s < S; s++) rmsnorm_row(nrm + (int64_t)s*D, x + (int64_t)s*D, l->post_ln, D, c->eps);
++        for (int s = 0; s < S; s++) rmsnorm_row(nrm + (int64_t)s*D, x + (int64_t)s*D, l->post_ln, D, c->eps, c->rms_add_one);
+         _t0 = tm_now();
+         moe(m, l, i, nrm, S, tmp);
+         tm_add(S, 2, tm_now()-_t0);
+@@ -2945,7 +2961,7 @@ static float *step(Model *m, const int *ids, int S, int pos_base) {
+         if (g_pin_use_logit && g_pin_logit)
+             serve_echo(g_echo_id, pos_base, ids[0], g_pin_logit, c->vocab, g_echo_k);
+         for (int p = 0; p + 1 < S; p++) {
+-            rmsnorm_row(erow, x + (int64_t)p*D, m->final_norm, D, c->eps);
++            rmsnorm_row(erow, x + (int64_t)p*D, m->final_norm, D, c->eps, c->rms_add_one);
+             if (!qt_lmhead_matmul(elog, erow, D, c->vocab))
+                 matmul_d(elog, erow, &m->lm_head, 1, D, c->vocab);
+             serve_echo(g_echo_id, pos_base + p + 1, ids[p+1], elog, c->vocab, g_echo_k);
+@@ -2954,7 +2970,7 @@ static float *step(Model *m, const int *ids, int S, int pos_base) {
+     }
+ #endif
+     float *last = falloc(D);
+-    rmsnorm_row(last, x + (int64_t)(S-1)*D, m->final_norm, D, c->eps);
++    rmsnorm_row(last, x + (int64_t)(S-1)*D, m->final_norm, D, c->eps, c->rms_add_one);
+     float *logit = falloc(c->vocab);
+     double _th = tm_now();
+     if (!qt_lmhead_matmul(logit, last, D, c->vocab))
+@@ -3018,7 +3034,7 @@ static void pilot_prefetch(Model *m, int lnext, const float *x, int S) {
+     float *logits = falloc((int64_t)S * E);
+     Layer *l = &m->L[lnext];
+     float *nrm_x = falloc((int64_t)S * D);
+-    for (int s = 0; s < S; s++) rmsnorm_row(nrm_x + (int64_t)s*D, x + (int64_t)s*D, l->post_ln, D, c->eps);
++    for (int s = 0; s < S; s++) rmsnorm_row(nrm_x + (int64_t)s*D, x + (int64_t)s*D, l->post_ln, D, c->eps, c->rms_add_one);
+     matmul_d(logits, nrm_x, &l->gate, S, D, E);   /* int8 copy (f32 may be freed) */
+     free(nrm_x);
+     for (int s = 0; s < S; s++) {
+@@ -4685,7 +4701,7 @@ static int qwen36_edge_select(void *engine_impl,
+                                            "Qwen3.6 Edge selection cancelled");
+         }
+         rmsnorm_row(normalized, input + (size_t)row * config->hidden,
+-                    engine->model.final_norm, config->hidden, config->eps);
++                    engine->model.final_norm, config->hidden, config->eps, config->rms_add_one);
+         matmul_d(logits, normalized, &engine->model.lm_head,
+                  1, config->hidden, config->vocab);
+         if (coli_edge_argmax(logits, (uint32_t)config->vocab,
+@@ -4715,7 +4731,7 @@ static int qwen36_edge_logits(void *engine_impl,
+                                            "Qwen3.6 Edge logits cancelled");
+         }
+         rmsnorm_row(normalized, input + (size_t)row * config->hidden,
+-                    engine->model.final_norm, config->hidden, config->eps);
++                    engine->model.final_norm, config->hidden, config->eps, config->rms_add_one);
+         matmul_d(request->logits + (size_t)row * config->vocab,
+                  normalized, &engine->model.lm_head,
+                  1, config->hidden, config->vocab);
+diff --git a/c/tools/convert_qwen36.py b/c/tools/convert_qwen36.py
+index d97d79f..6cb2668 100644
+--- a/c/tools/convert_qwen36.py
++++ b/c/tools/convert_qwen36.py
+@@ -387,9 +387,13 @@ def main():
+ 
+     layer_types = mcfg.get("layer_types")
+     if layer_types is None:
+-        # infer: every 4th layer is full_attention (Qwen3.5/3.6 convention)
+         n = mcfg.get("num_hidden_layers", n_layers_weight)
+-        layer_types = ["full_attention" if i % 4 == 3 else "linear_attention" for i in range(n)]
++        if mcfg.get("model_type") == "qwen3_moe":
++            # Standard Qwen3-MoE uses ordinary causal attention in every layer.
++            layer_types = ["full_attention"] * n
++        else:
++            # Qwen3.5/3.6 hybrid convention.
++            layer_types = ["full_attention" if i % 4 == 3 else "linear_attention" for i in range(n)]
+     full_idx = [i for i, lt in enumerate(layer_types) if lt == "full_attention"]
+     all_idx = list(range(len(layer_types)))
+     print(f"layers: {len(layer_types)} total, {len(full_idx)} full_attention (Phase 2: all {len(all_idx)} stored)")
+@@ -521,7 +525,7 @@ def main():
+         #              model.layers.i.mlp.experts.{e}.gate_proj [inter,H]
+         #              model.layers.i.mlp.experts.{e}.up_proj   [inter,H]
+         #              model.layers.i.mlp.experts.{e}.down_proj [H,inter]
+-        sep = {}  # e -> {'gate':Tensor,'up':Tensor,'down':Tensor}
++        sep_keys = {}  # e -> {'gate_proj': key, 'up_proj': key, 'down_proj': key}
+         for k in lk:
+             if re.search(r"\.experts\.gate_up_proj(?:\.weight)?$", k):
+                 gu = get_tensor(k).float()            # [E, 2*inter, H]
+@@ -535,18 +539,26 @@ def main():
+                     mw, qs = make_merged(gate[e], up[e], down[e], args.ebits, gs=args.gs, down_bits=args.down_bits, down_gs=args.down_gs)
+                     tens[f"model.layers.{a}.mlp.experts.{e}.merged_weight"] = mw
+                     tens[f"model.layers.{a}.mlp.experts.{e}.qs"] = qs
++                del gu, gate, up, down
+                 continue
+             ms = re.search(r"\.experts\.(\d+)\.(gate_proj|up_proj|down_proj)(?:\.weight)?$", k)
+             if ms:
+                 e = int(ms.group(1)); proj = ms.group(2)
+-                sep.setdefault(e, {})[proj] = get_tensor(k).float()
++                sep_keys.setdefault(e, {})[proj] = k
+                 continue
+-        for e in sorted(sep):
+-            d = sep[e]
+-            if "gate_proj" in d and "up_proj" in d and "down_proj" in d:
+-                mw, qs = make_merged(d["gate_proj"], d["up_proj"], d["down_proj"], args.ebits, gs=args.gs, down_bits=args.down_bits, down_gs=args.down_gs)
++        # Standard Qwen3 checkpoints store experts separately. Loading every
++        # expert as float32 before quantising costs several GB per layer; keep
++        # only one expert's three projections resident at a time instead.
++        for e in sorted(sep_keys):
++            d = sep_keys[e]
++            if all(name in d for name in ("gate_proj", "up_proj", "down_proj")):
++                gate = get_tensor(d["gate_proj"]).float()
++                up = get_tensor(d["up_proj"]).float()
++                down = get_tensor(d["down_proj"]).float()
++                mw, qs = make_merged(gate, up, down, args.ebits, gs=args.gs, down_bits=args.down_bits, down_gs=args.down_gs)
+                 tens[f"model.layers.{a}.mlp.experts.{e}.merged_weight"] = mw
+                 tens[f"model.layers.{a}.mlp.experts.{e}.qs"] = qs
++                del gate, up, down, mw, qs
+             else:
+                 print(f"[layer {i}] WARN expert {e} missing some proj "
+                       f"(have {sorted(d.keys())}) — skipped")
+@@ -574,7 +586,7 @@ def main():
+         "num_experts": int(mcfg["num_experts"]),
+         "topk": int(mcfg["num_experts_per_tok"]),
+         "moe_inter": int(mcfg.get("moe_intermediate_size", mcfg.get("intermediate_size", 0) // 2)),
+-        "shared_inter": int(mcfg.get("shared_expert_intermediate_size", mcfg.get("moe_intermediate_size", 0))),
++        "shared_inter": int(mcfg.get("shared_expert_intermediate_size", 0 if mcfg.get("model_type") == "qwen3_moe" else mcfg.get("moe_intermediate_size", 0))),
+         "rms_eps": float(mcfg.get("rms_norm_eps", 1e-6)),
+         "ebits": args.ebits,
+         "scoring_func": mcfg.get("scoring_func", "softmax"),
+@@ -582,9 +594,10 @@ def main():
+         "topk_group": int(mcfg.get("topk_group", 1)),
+         "norm_topk_prob": bool(mcfg.get("norm_topk_prob", False)),
+         "attn_output_gate": bool(mcfg.get("attn_output_gate", False)),
+-        "rope_theta": float((mcfg.get("rope_parameters") or {}).get("rope_theta", 10000000.0)),
++        "rms_add_one": bool(mcfg.get("model_type") != "qwen3_moe"),
++        "rope_theta": float(mcfg.get("rope_theta", (mcfg.get("rope_parameters") or {}).get("rope_theta", 10000000.0))),
+         "mrope_section": (mcfg.get("rope_parameters") or {}).get("mrope_section", [16, 16, 16]),
+-        "partial_rotary_factor": float(mcfg.get("partial_rotary_factor", 0.25)),
++        "partial_rotary_factor": float(mcfg.get("partial_rotary_factor", 1.0 if mcfg.get("model_type") == "qwen3_moe" else 0.25)),
+     }
+     # derive head dims from first full-attention layer weights (authoritative).
+     # Read from SOURCE (not local output) so this works even when layer 0 was

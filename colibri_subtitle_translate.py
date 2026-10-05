@@ -352,7 +352,7 @@ class SubtitleTranslator:
 
 
 def translate_srt(raw, start, limit, translator, source, target, state,
-                  label, block_cues, quiet=False):
+                  label, block_cues, quiet=False, checkpoint=None):
     cues, newline = parse_srt(raw.decode("utf-8-sig"))
     state["cue_total"] = len(cues)
     if not quiet:
@@ -368,6 +368,7 @@ def translate_srt(raw, start, limit, translator, source, target, state,
         max_end = min(max_end, start + limit)
     pos = start
     done = 0
+    base_translated = state.get("translated", 0)
     started = time.time()
     while pos < max_end:
         end = min(max_end, pos + block_cues)
@@ -381,6 +382,9 @@ def translate_srt(raw, start, limit, translator, source, target, state,
         done += end - pos
         pos = end
         state["next_cue"] = pos
+        state["translated"] = base_translated + done
+        if checkpoint is not None:
+            checkpoint(render_srt(cues, newline).encode("utf-8"), state)
         if not quiet:
             elapsed = max(time.time() - started, 0.001)
             print(
@@ -397,25 +401,37 @@ def process_srt_file(src, out, args, translator, label=None):
     raw = src.read_bytes()
     if not raw:
         raise ValueError("Input subtitle file is empty")
-    if out.exists() and state_path.exists() and not args.fresh:
+    if state_path.exists() and not args.fresh:
         try:
             old = json.loads(state_path.read_text(encoding="utf-8"))
             if old.get("source") == str(src):
-                raw = out.read_bytes()
-                state.update(old)
-                print("[RESUME]", label or src, "from cue", state["next_cue"] + 1, flush=True)
+                partial = old.get("partial_output")
+                if isinstance(partial, str):
+                    raw = partial.encode("utf-8")
+                    state.update(old)
+                    print("[RESUME]", label or src, "from cue", state["next_cue"] + 1, flush=True)
+                elif out.exists():
+                    raw = out.read_bytes()
+                    state.update(old)
+                    print("[RESUME]", label or src, "from cue", state["next_cue"] + 1, flush=True)
         except Exception as exc:
             print("[WARN] Ignoring invalid resume data:", exc, flush=True)
+    out.parent.mkdir(parents=True, exist_ok=True)
+
+    def save_checkpoint(partial_output, current_state):
+        current_state["partial_output"] = partial_output.decode("utf-8")
+        write_state(state_path, current_state)
+
     translated, count = translate_srt(
         raw, state["next_cue"], args.limit, translator,
         args.source_language, args.target_language, state,
         label or str(src), args.block_cues, args.quiet,
+        checkpoint=save_checkpoint,
     )
-    state["translated"] = state.get("translated", 0) + count
-    out.parent.mkdir(parents=True, exist_ok=True)
     tmp = Path(str(out) + ".tmp")
     tmp.write_bytes(translated)
     os.replace(tmp, out)
+    state.pop("partial_output", None)
     write_state(state_path, state)
     print("[DONE]", label or src, "| added", count, "cues |", out, flush=True)
     return state
@@ -476,7 +492,6 @@ def process_zip(src, out, args, translator):
             args.source_language, args.target_language, state,
             info.filename, args.block_cues, args.quiet,
         )
-        state["translated"] += count
         complete = state["next_cue"] >= state["cue_total"]
         state["entry"] = index + 1 if complete else index
         if complete:

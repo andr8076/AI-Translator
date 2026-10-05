@@ -497,7 +497,7 @@ def main():
     parser.add_argument("--allow-sleep", action="store_true")
     parser.add_argument("--port", type=int, default=8768)
     parser.add_argument("--context-size", type=int, default=4096)
-    parser.add_argument("--ram-gb", type=float, default=0.0)
+    parser.add_argument("--ram-gb", type=int, default=0)
     parser.add_argument("--cap", type=int, default=4)
     parser.add_argument("--gpu", default="none")
     parser.add_argument("--startup-timeout", type=int, default=300)

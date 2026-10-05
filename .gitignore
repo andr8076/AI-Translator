@@ -1,0 +1,6 @@
+.runtime/
+.models/
+__pycache__/
+*.progress.json
+*_colibri_da.srt
+*_colibri_da.zip

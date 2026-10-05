@@ -176,10 +176,12 @@ class ColibriServer:
             "--model-id", self.model_id,
             "--api-key", self.key,
             "--ctx", str(self.context),
-            "--gpu", self.gpu,
+            "--auto-tier",
             "--policy", "quality",
             "--temp", "0.05",
         ]
+        if self.gpu and self.gpu.lower() not in ("none", "cpu", "off"):
+            cmd += ["--gpu", self.gpu]
         if self.ram_gb > 0:
             cmd += ["--ram", str(self.ram_gb)]
         if self.cap > 0:
@@ -214,10 +216,14 @@ class ColibriServer:
         except OSError:
             return "(no Colibri log available)"
 
-    def chat(self, prompt, max_tokens=1024):
+    def chat(self, prompt, max_tokens=1024, system=None):
+        messages = []
+        if system:
+            messages.append({"role": "system", "content": system})
+        messages.append({"role": "user", "content": prompt})
         payload = {
             "model": self.model_id,
-            "messages": [{"role": "user", "content": prompt}],
+            "messages": messages,
             "temperature": 0.05,
             "top_p": 0.9,
             "max_tokens": max_tokens,
@@ -254,44 +260,76 @@ class SubtitleTranslator:
         self.server = server
 
     @staticmethod
+    def passthrough(cue):
+        text = "\n".join(cue["body"]).strip()
+        return bool(re.fullmatch(r"(?:\[[^\n]*\]|\([^\n]*\))", text))
+
+    @staticmethod
     def prompt(cues, source, target, before=(), after=()):
         target_text = "\n".join(
             "@@%d@@\n%s" % (i, "\n".join(cue["body"]))
             for i, cue in enumerate(cues)
+            if not SubtitleTranslator.passthrough(cue)
         )
-        before_text = "\n".join("\n".join(c["body"]) for c in before)
-        after_text = "\n".join("\n".join(c["body"]) for c in after)
-        return (
-            "You are a professional subtitle translator.\n"
-            "Translate the marked dialogue from %s to natural, idiomatic %s.\n"
-            "Output ONLY the translated marked cues. Do not answer the dialogue, "
-            "explain anything, or add commentary.\n"
-            "Keep every @@number@@ marker exactly unchanged and in the same order.\n"
-            "Preserve names, meaning, tone, HTML tags, bracketed sound/music cues, "
-            "punctuation, and line breaks where practical.\n"
-            "Use REFERENCE BEFORE/AFTER only for context; never output them.\n\n"
-            "REFERENCE BEFORE:\n%s\nEND REFERENCE BEFORE\n\n"
-            "TRANSLATE THESE CUES:\n%s\nEND CUES\n\n"
-            "REFERENCE AFTER:\n%s\nEND REFERENCE AFTER\n"
-        ) % (source, target, before_text, target_text, after_text)
+        # OLMoE is deliberately given only the text it must translate.
+        # Supplying surrounding dialogue caused this small model to translate
+        # reference context instead of the marked target cues.
+        return target_text
 
     def translate_chunk(self, cues, source, target, before=(), after=()):
+        active = {
+            i for i, cue in enumerate(cues)
+            if not self.passthrough(cue)
+        }
+        if not active:
+            return [dict(cue, body=list(cue["body"])) for cue in cues]
+
         prompt = self.prompt(cues, source, target, before, after)
-        max_tokens = min(1800, max(256, len(prompt) // 2))
-        output = self.server.chat(prompt, max_tokens=max_tokens)
+        cue_text = " ".join(
+            " ".join(cues[i]["body"]) for i in sorted(active)
+        )
+        source_words = len(re.findall(r"\S+", cue_text))
+        max_tokens = min(512, max(32, source_words * 3 + 16))
+        system = (
+            "You are a strict subtitle translation engine. "
+            "Translate from %s to natural, idiomatic %s. "
+            "Translate every ordinary %s word; do not leave source-language words "
+            "unchanged when a normal %s translation exists. Keep proper names. "
+            "Style examples: 'Mary went home because she was tired.' becomes "
+            "'Mary gik hjem, fordi hun var træt.' Keep character names unchanged; "
+            "for example, 'Where is Charles?' -> 'Hvor er Charles?'. When 'you' "
+            "means one person, use 'dig', as in 'I will see you tomorrow.' -> "
+            "'Jeg vil se dig i morgen.' These examples are guidance only; "
+            "do not output them. "
+            "Return ONLY the @@number@@ blocks from the user message, in the same "
+            "order, with translated subtitle text. Never output context, headings, "
+            "instructions, explanations, END CUES, or REFERENCE text."
+        ) % (source, target, source, target)
+        output = self.server.chat(
+            prompt, max_tokens=max_tokens, system=system
+        )
+        forbidden = (
+            "END CUES", "REFERENCE BEFORE", "REFERENCE AFTER",
+            "TRANSLATE THESE CUES", "Context before:", "Context after:",
+        )
+        if any(token.lower() in output.lower() for token in forbidden):
+            raise RuntimeError("Model echoed prompt scaffolding")
         matches = MARKER_RE.findall(output)
         translated = {int(number): body.strip("\n ") for number, body in matches}
-        expected = set(range(len(cues)))
-        if set(translated) != expected or any(not translated[i].strip() for i in expected):
-            missing = sorted(expected - set(translated))[:12]
+        if set(translated) != active or any(not translated[i].strip() for i in active):
+            missing = sorted(active - set(translated))[:12]
             raise RuntimeError(
                 "Malformed structured translation: returned %d/%d cues; missing %s"
-                % (len(translated), len(expected), missing)
+                % (len(translated), len(active), missing)
             )
-        return [
-            dict(cue, body=translated[i].split("\n"))
-            for i, cue in enumerate(cues)
-        ]
+        result = []
+        for i, cue in enumerate(cues):
+            if i in active:
+                result.append(dict(cue, body=translated[i].split("\n")))
+            else:
+                result.append(dict(cue, body=list(cue["body"])))
+        return result
+
 
     def translate_resilient(self, cues, source, target, before=(), after=()):
         try:
@@ -463,20 +501,55 @@ def runtime_ok(coli_bin, model):
 
 
 def maybe_setup(args):
+    setup = ROOT / "setup_colibri.sh"
+    runtime_ready = Path(args.coli_bin).is_file() and os.access(args.coli_bin, os.X_OK)
+    if not runtime_ready and setup.is_file():
+        print("[SETUP] Colibri runtime missing; building it automatically...", flush=True)
+        subprocess.run(
+            [
+                "bash", str(setup), "--runtime",
+                "--runtime-dir", str(ROOT / ".runtime" / "colibri"),
+                "--model-dir", str(args.model),
+            ],
+            check=False,
+        )
     if runtime_ok(args.coli_bin, args.model):
         return
-    setup = ROOT / "setup_colibri.sh"
-    if not setup.is_file():
-        return
-    print("[SETUP] Colibri runtime/model incomplete; running setup check...", flush=True)
-    subprocess.run(
-        [
-            "bash", str(setup), "--check",
-            "--runtime-dir", str(ROOT / ".runtime" / "colibri"),
-            "--model-dir", str(args.model),
-        ],
-        check=False,
+    if setup.is_file():
+        print("[SETUP] Running Colibri readiness check...", flush=True)
+        subprocess.run(
+            [
+                "bash", str(setup), "--check",
+                "--runtime-dir", str(ROOT / ".runtime" / "colibri"),
+                "--model-dir", str(args.model),
+            ],
+            check=False,
+        )
+
+
+def colibri_doctor(coli_bin, model, context, ram_gb, cap, gpu):
+    """Validate the same resource plan that the server will use."""
+    cmd = [
+        str(coli_bin), "doctor", "--model", str(model),
+        "--ctx", str(context), "--auto-tier", "--policy", "quality",
+    ]
+    if gpu and gpu.lower() not in ("none", "cpu", "off"):
+        cmd += ["--gpu", gpu]
+    if ram_gb > 0:
+        cmd += ["--ram", str(ram_gb)]
+    if cap > 0:
+        cmd += ["--cap", str(cap)]
+    result = subprocess.run(
+        cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+        text=True, check=False,
     )
+    output = result.stdout.strip()
+    if output:
+        print(output, flush=True)
+    if result.returncode != 0:
+        raise RuntimeError(
+            "Colibri doctor reported that this model/runtime is not ready."
+        )
 
 
 def main():
@@ -498,7 +571,7 @@ def main():
     parser.add_argument("--port", type=int, default=8768)
     parser.add_argument("--context-size", type=int, default=4096)
     parser.add_argument("--ram-gb", type=int, default=0)
-    parser.add_argument("--cap", type=int, default=4)
+    parser.add_argument("--cap", type=int, default=0)
     parser.add_argument("--gpu", default="none")
     parser.add_argument("--startup-timeout", type=int, default=300)
     parser.add_argument("--model-id", default=DEFAULT_MODEL_ID)
@@ -546,6 +619,11 @@ def main():
     if not args.allow_sleep:
         sleep_inhibitor = start_sleep_inhibitor()
     key = os.environ.get("COLIBRI_TRANSLATOR_API_KEY", DEFAULT_KEY)
+    print("[COLIBRI] Preflight check...", flush=True)
+    colibri_doctor(
+        args.coli_bin, args.model, args.context_size, args.ram_gb,
+        args.cap, args.gpu,
+    )
     server = ColibriServer(
         args.coli_bin, args.model, args.model_id, key, args.port,
         args.context_size, args.ram_gb, args.cap, args.gpu,

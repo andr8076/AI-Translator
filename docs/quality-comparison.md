@@ -19,6 +19,12 @@ The first 32 source cues were translated with identical model/runtime settings. 
 
 The 16-cue configuration remains the recommended default. A 32-cue block did not provide a measured, reliable quality or speed benefit and was not adopted.
 
+## Memory/cache finding
+
+The original backend always enabled llama.cpp prompt KV caching. On the 8 GB Farm4 profile, a full pilot with that setting reached cue 352/698, filled the 2 GiB swap, and was stopped cleanly to avoid an uncontrolled thrash. The stable path now leaves caching off by default and exposes `--cache-prompt` as an explicit opt-in for hosts with enough RAM. Long runs also restart llama.cpp every eight 16-cue blocks (128 cues) by default, releasing accumulated allocator/KV memory without changing the prompt or model.
+
+A cache-off smoke run translated the same 32-cue/16-block workload in 149.88 s. A forced-restart variant took 150.72 s and produced a byte-identical SRT, so the restart overhead was about 0.6% in that check. During the final pilot, the preserved checkpoint was resumed from cue 481; cues 481-698 completed in 1044.62 s (218 cues, 4.79 s/cue), with restarts at cues 512 and 640. The final output reached checkpoint `next_cue=698`, and host memory returned to about 6.8 GiB available after shutdown.
+
 ## Quality observations
 
 All compared files retained 32 cues, original numbering, timestamps, and cue order. No extra or missing dialogue cues were introduced.
@@ -39,10 +45,11 @@ The Danish reference is a quality guide, not a required wording match. The remai
 - Final output is checked for unchanged numbering and timestamps.
 - Duplicate structured-response markers are rejected; a single-cue response can still use the existing plain-text fallback.
 - Colibrì hot-pin patch application is idempotent and setup preserves an already modified local runtime.
-- A dependency-free regression suite covers parser/rendering, layout preservation, marker contracts, malformed input, Danish detection, and checkpoint/resume.
+- A dependency-free regression suite covers parser/rendering, layout preservation, marker contracts, malformed input, Danish detection, checkpoint/resume, explicit prompt-cache behavior, and restart scheduling.
+- TranslateGemma prompt caching is explicit (`--cache-prompt`); the default low-RAM path restarts the server every eight blocks and preserves the checkpoint before each restart.
 
 Two prompt variants were tested and discarded. A verbose output-contract prompt caused max-token responses; a shorter semantic-hints variant caused recursive structured-response retries. Neither is part of the final code.
 
 ## Quality gate
 
-The implementation is structurally reliable and the 16-cue CPU baseline is reproducible. The quality gate for unattended full-season translation is **not passed**: the Q6 model still needs human review for pronouns, idioms, and proper names. The existing 698-cue pilot output is complete and structurally valid, but it is not evidence that those semantic issues are solved.
+The implementation is structurally reliable and the 16-cue CPU baseline is reproducible. The quality gate for unattended full-season translation is **not passed**: the Q6 model still needs human review for pronouns, idioms, and proper names. The final 698-cue pilot output is complete and structurally valid, but it is not evidence that those semantic issues are solved.

@@ -40,7 +40,7 @@ python3 colibri_subtitle_translate.py \
   --block-cues 16
 ```
 
-The default TranslateGemma settings already select Q6, CPU, a 2048-token context, and 16-cue blocks. Use `--device auto` only when a supported llama.cpp accelerator has been independently verified; CPU is the reproducible Farm4 setting.
+The default TranslateGemma settings already select Q6, CPU, a 2048-token context, and 16-cue blocks. Use `--device auto` only when a supported llama.cpp accelerator has been independently verified; CPU is the reproducible Farm4 setting. Prompt KV caching is disabled by default on the 8 GB profile because a long cache-enabled run grew into swap pressure; use `--cache-prompt` only when extra RAM is available and the trade-off has been benchmarked. Long runs restart the inference server every 8 blocks (128 cues) by default to release accumulated allocator/KV memory; use `--restart-every 0` only when you have independently verified enough RAM.
 
 Translate a directory (the output is a sibling directory) or a ZIP:
 
@@ -66,8 +66,9 @@ On Farm4 (Xeon E3-1505L v5, 4 cores/8 threads, CPU-only), the measured Q6 baseli
 | 16-cue blocks, 16 cues | 79.45 s |
 | 16-cue blocks, 32 cues | 148.13 s |
 | 8-cue blocks, 8 cues | about 44 s |
+| Resumed final pilot, cues 481-698, 16-cue blocks | 1044.62 s |
 
-The 32-cue comparison produced valid SRT but no meaningful quality advantage; it changed question interpretation in one cue and retained awkward wording elsewhere. Keep 16-cue blocks unless a new model or prompt is benchmarked with the same quality checks.
+The 32-cue comparison produced valid SRT but no meaningful quality advantage; it changed question interpretation in one cue and retained awkward wording elsewhere. Keep 16-cue blocks unless a new model or prompt is benchmarked with the same quality checks. The completed 698-cue pilot passed the strict SRT/layout gate; the resumed segment took 1044.62 s with cache off and the default eight-block server restart cadence.
 
 The current Q6 model can still make occasional Danish pronoun, idiom, and proper-name mistakes. The pilot output therefore requires human review before publishing or using it as a full-season batch. Valid SRT structure is not a substitute for translation-quality review.
 

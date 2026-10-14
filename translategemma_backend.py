@@ -103,6 +103,7 @@ class TranslateGemmaServer:
     def __init__(
         self, llama_bin, model, key, port, context, threads,
         log_path, startup_timeout, device="auto", gpu_layers="all",
+        cache_prompt=False,
     ):
         self.llama_bin = Path(llama_bin)
         self.model = Path(model)
@@ -112,6 +113,7 @@ class TranslateGemmaServer:
         self.threads = threads
         self.device_option = device
         self.gpu_layers = gpu_layers
+        self.cache_prompt = cache_prompt
         self.device = None
         self.force_cpu = False
         self.log_path = Path(log_path)
@@ -229,7 +231,7 @@ class TranslateGemmaServer:
             "n_predict": min(512, max(32, int(max_tokens))),
             "temperature": 0.0,
             "stop": ["<end_of_turn>", "<eos>"],
-            "cache_prompt": True,
+            "cache_prompt": self.cache_prompt,
         }
         result = _http_json(
             self.api + "/completion",
@@ -238,6 +240,14 @@ class TranslateGemmaServer:
             timeout=900,
         )
         return (result.get("content") or "").strip()
+
+    def restart(self):
+        """Release llama.cpp memory and start a fresh server on the next port."""
+        self.stop()
+        self.port = _free_port(self.port)
+        self.api = "http://127.0.0.1:%d" % self.port
+        print("[TRANSLATEGEMMA] Restarting server to release inference memory", flush=True)
+        self.start()
 
     def _log_tail(self):
         try:

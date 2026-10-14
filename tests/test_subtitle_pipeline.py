@@ -6,8 +6,10 @@ import tempfile
 import unittest
 import zipfile
 from pathlib import Path
+from unittest import mock
 
 import colibri_subtitle_translate as app
+import translategemma_backend as translategemma
 
 
 RAW = (
@@ -87,6 +89,23 @@ class SubtitlePipelineTests(unittest.TestCase):
         self.assertIn("@@0@@", prompt)
         self.assertEqual((source, target), ("English", "Danish"))
 
+    def test_translategemma_prompt_cache_is_explicit(self):
+        for enabled in (False, True):
+            server = translategemma.TranslateGemmaServer.__new__(
+                translategemma.TranslateGemmaServer
+            )
+            server.api = "http://127.0.0.1:8768"
+            server.key = "test-key"
+            server.cache_prompt = enabled
+            with mock.patch.object(
+                translategemma, "_http_json", return_value={"content": "Hej"}
+            ) as request:
+                self.assertEqual(
+                    server.translate("Hello", 32, "English", "Danish"), "Hej"
+                )
+            payload = request.call_args.kwargs["payload"]
+            self.assertIs(payload["cache_prompt"], enabled)
+
     def test_checkpoint_and_resume(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -119,6 +138,17 @@ class SubtitlePipelineTests(unittest.TestCase):
             final, _ = app.parse_srt(output.read_text(encoding="utf-8"))
             self.assertEqual(final[0]["body"], ["Danish 0"])
             self.assertEqual(final[1]["body"], ["Danish 0"])
+
+            restarted_output = root / "restarted.srt"
+            restart_server = MarkerServer()
+            restart_server.restart = mock.Mock()
+            args.fresh = True
+            args.restart_every = 1
+            app.process_srt_file(
+                source, restarted_output, args,
+                app.SubtitleTranslator(restart_server)
+            )
+            self.assertEqual(restart_server.restart.call_count, 1)
 
     def test_zip_checkpoint_and_resume(self):
         with tempfile.TemporaryDirectory() as directory:

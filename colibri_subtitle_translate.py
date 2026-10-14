@@ -433,7 +433,8 @@ class SubtitleTranslator:
 
 
 def translate_srt(raw, start, limit, translator, source, target, state,
-                  label, block_cues, quiet=False, checkpoint=None):
+                  label, block_cues, quiet=False, checkpoint=None,
+                  restart_every=0):
     cues, newline = parse_srt(raw.decode("utf-8-sig"))
     state["cue_total"] = len(cues)
     if not quiet:
@@ -450,6 +451,7 @@ def translate_srt(raw, start, limit, translator, source, target, state,
     pos = start
     done = 0
     base_translated = state.get("translated", 0)
+    block_count = start // block_cues
     started = time.time()
     while pos < max_end:
         end = min(max_end, pos + block_cues)
@@ -473,6 +475,13 @@ def translate_srt(raw, start, limit, translator, source, target, state,
                 % (label, pos - len(translated) + 1, pos, len(cues), done / elapsed),
                 flush=True,
             )
+        block_count += 1
+        restart = getattr(getattr(translator, "server", None), "restart", None)
+        if (
+            restart_every and pos < max_end and
+            block_count % restart_every == 0 and restart is not None
+        ):
+            restart()
     rendered = render_srt(cues, newline).encode("utf-8")
     rendered_cues, _ = parse_srt(rendered.decode("utf-8"))
     validate_srt_layout(cues, rendered_cues)
@@ -511,6 +520,7 @@ def process_srt_file(src, out, args, translator, label=None):
         args.source_language, args.target_language, state,
         label or str(src), args.block_cues, args.quiet,
         checkpoint=save_checkpoint,
+        restart_every=getattr(args, "restart_every", 0),
     )
     tmp = Path(str(out) + ".tmp")
     tmp.write_bytes(translated)
@@ -590,6 +600,7 @@ def process_zip(src, out, args, translator):
             args.source_language, args.target_language, state,
             info.filename, args.block_cues, args.quiet,
             checkpoint=save_zip_checkpoint,
+            restart_every=getattr(args, "restart_every", 0),
         )
         complete = state["next_cue"] >= state["cue_total"]
         state["entry"] = index + 1 if complete else index
@@ -694,6 +705,14 @@ def main():
     )
     parser.add_argument("--gpu-layers", default="all")
     parser.add_argument("--threads", type=int, default=4)
+    parser.add_argument(
+        "--cache-prompt", action="store_true",
+        help="Reuse llama.cpp prompt KV cache (faster, but uses more RAM)",
+    )
+    parser.add_argument(
+        "--restart-every", type=int, default=8,
+        help="Restart TranslateGemma after this many blocks (0 disables; default: 8)",
+    )
     parser.add_argument("--model", default=str(DEFAULT_MODEL))
     parser.add_argument("--coli-bin", default=str(DEFAULT_COLI))
     parser.add_argument("--source-language", default="English")
@@ -731,6 +750,8 @@ def main():
         parser.error("TranslateGemma supports at most 2048 context tokens")
     if args.threads < 1:
         parser.error("--threads must be at least 1")
+    if args.restart_every < 0:
+        parser.error("--restart-every cannot be negative")
     if args.cap < 0:
         parser.error("--cap cannot be negative")
     if args.suffix and not args.suffix.startswith(("_", "-", ".")):
@@ -795,6 +816,8 @@ def main():
                 args.gguf_model,
                 "| threads:", args.threads,
                 "| context:", args.context_size,
+                "| prompt-cache:", "on" if args.cache_prompt else "off",
+                "| restart-every:", args.restart_every,
                 flush=True,
             )
             server = TranslateGemmaServer(
@@ -803,6 +826,7 @@ def main():
                 ROOT / ".runtime" / "translategemma.log",
                 args.startup_timeout, device=args.device,
                 gpu_layers=args.gpu_layers,
+                cache_prompt=args.cache_prompt,
             )
         else:
             maybe_setup(args)

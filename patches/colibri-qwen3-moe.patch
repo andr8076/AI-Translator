@@ -1,8 +1,17 @@
 diff --git a/c/family_registry.py b/c/family_registry.py
-index d1fb387..b43b8c0 100644
+index d1fb387..cd9b0a3 100644
 --- a/c/family_registry.py
 +++ b/c/family_registry.py
-@@ -230,16 +230,22 @@ def _qwen36_geometry(config, context, _model_dir):
+@@ -213,6 +213,8 @@ def _qwen36_layer_types(config, layers, model_dir):
+             kinds = meta.get("layer_types")
+             if isinstance(kinds, list) and len(kinds) == layers:
+                 return kinds
++    if config.get("model_type") == "qwen3_moe":
++        return ["full_attention"] * layers
+     interval = config.get("full_attention_interval")
+     if isinstance(interval, int) and not isinstance(interval, bool) and interval >= 1:
+         return ["full_attention" if (i + 1) % interval == 0 else "linear_attention"
+@@ -230,16 +232,22 @@ def _qwen36_geometry(config, context, _model_dir):
      layers = _required_int(config, "num_hidden_layers", "qwen36")
      kinds = _qwen36_layer_types(config, layers, _model_dir)
      full = sum(kind == "full_attention" for kind in kinds)
@@ -34,7 +43,7 @@ index d1fb387..b43b8c0 100644
      return PlannerGeometry(kv, fixed, 0, _required_int(config, "num_experts", "qwen36"))
  
  
-@@ -1288,7 +1294,7 @@ FAMILIES = (
+@@ -1288,7 +1296,7 @@ FAMILIES = (
      ),
      FamilyDescriptor(
          id="qwen36",
@@ -43,7 +52,7 @@ index d1fb387..b43b8c0 100644
          display_name="Qwen3.6-35B-A3B",
          display_scale="35B",
          # Both checkpoints declare qwen3_5_moe_text. Keyed on the three
-@@ -1301,6 +1307,9 @@ FAMILIES = (
+@@ -1301,6 +1309,9 @@ FAMILIES = (
              DisplayVariant((("num_hidden_layers", 92), ("num_experts", 512),
                              ("hidden_size", 8192)),
                             "Qwen3.8-2.4T-A95B", "2.4T"),
@@ -305,10 +314,10 @@ index e751501..5eca0b3 100644
                   normalized, &engine->model.lm_head,
                   1, config->hidden, config->vocab);
 diff --git a/c/tools/convert_qwen36.py b/c/tools/convert_qwen36.py
-index d97d79f..6cb2668 100644
+index d97d79f..0a4cbb1 100644
 --- a/c/tools/convert_qwen36.py
 +++ b/c/tools/convert_qwen36.py
-@@ -387,9 +387,13 @@ def main():
+@@ -387,9 +387,12 @@ def main():
  
      layer_types = mcfg.get("layer_types")
      if layer_types is None:
@@ -316,7 +325,6 @@ index d97d79f..6cb2668 100644
          n = mcfg.get("num_hidden_layers", n_layers_weight)
 -        layer_types = ["full_attention" if i % 4 == 3 else "linear_attention" for i in range(n)]
 +        if mcfg.get("model_type") == "qwen3_moe":
-+            # Standard Qwen3-MoE uses ordinary causal attention in every layer.
 +            layer_types = ["full_attention"] * n
 +        else:
 +            # Qwen3.5/3.6 hybrid convention.
@@ -324,7 +332,7 @@ index d97d79f..6cb2668 100644
      full_idx = [i for i, lt in enumerate(layer_types) if lt == "full_attention"]
      all_idx = list(range(len(layer_types)))
      print(f"layers: {len(layer_types)} total, {len(full_idx)} full_attention (Phase 2: all {len(all_idx)} stored)")
-@@ -521,7 +525,7 @@ def main():
+@@ -521,7 +524,7 @@ def main():
          #              model.layers.i.mlp.experts.{e}.gate_proj [inter,H]
          #              model.layers.i.mlp.experts.{e}.up_proj   [inter,H]
          #              model.layers.i.mlp.experts.{e}.down_proj [H,inter]
@@ -333,7 +341,7 @@ index d97d79f..6cb2668 100644
          for k in lk:
              if re.search(r"\.experts\.gate_up_proj(?:\.weight)?$", k):
                  gu = get_tensor(k).float()            # [E, 2*inter, H]
-@@ -535,18 +539,26 @@ def main():
+@@ -535,18 +538,25 @@ def main():
                      mw, qs = make_merged(gate[e], up[e], down[e], args.ebits, gs=args.gs, down_bits=args.down_bits, down_gs=args.down_gs)
                      tens[f"model.layers.{a}.mlp.experts.{e}.merged_weight"] = mw
                      tens[f"model.layers.{a}.mlp.experts.{e}.qs"] = qs
@@ -349,9 +357,8 @@ index d97d79f..6cb2668 100644
 -            d = sep[e]
 -            if "gate_proj" in d and "up_proj" in d and "down_proj" in d:
 -                mw, qs = make_merged(d["gate_proj"], d["up_proj"], d["down_proj"], args.ebits, gs=args.gs, down_bits=args.down_bits, down_gs=args.down_gs)
-+        # Standard Qwen3 checkpoints store experts separately. Loading every
-+        # expert as float32 before quantising costs several GB per layer; keep
-+        # only one expert's three projections resident at a time instead.
++        # Standard Qwen3 checkpoints store experts separately. Keep only one
++        # expert's three float32 projections resident while quantising it.
 +        for e in sorted(sep_keys):
 +            d = sep_keys[e]
 +            if all(name in d for name in ("gate_proj", "up_proj", "down_proj")):
@@ -365,7 +372,7 @@ index d97d79f..6cb2668 100644
              else:
                  print(f"[layer {i}] WARN expert {e} missing some proj "
                        f"(have {sorted(d.keys())}) — skipped")
-@@ -574,7 +586,7 @@ def main():
+@@ -574,7 +584,7 @@ def main():
          "num_experts": int(mcfg["num_experts"]),
          "topk": int(mcfg["num_experts_per_tok"]),
          "moe_inter": int(mcfg.get("moe_intermediate_size", mcfg.get("intermediate_size", 0) // 2)),
@@ -374,7 +381,7 @@ index d97d79f..6cb2668 100644
          "rms_eps": float(mcfg.get("rms_norm_eps", 1e-6)),
          "ebits": args.ebits,
          "scoring_func": mcfg.get("scoring_func", "softmax"),
-@@ -582,9 +594,10 @@ def main():
+@@ -582,9 +592,10 @@ def main():
          "topk_group": int(mcfg.get("topk_group", 1)),
          "norm_topk_prob": bool(mcfg.get("norm_topk_prob", False)),
          "attn_output_gate": bool(mcfg.get("attn_output_gate", False)),

@@ -1,0 +1,53 @@
+diff --git a/c/olmoe.c b/c/olmoe.c
+index d56b606..2d6d8b2 100644
+--- a/c/olmoe.c
++++ b/c/olmoe.c
+@@ -628,7 +628,7 @@ static void model_init_range(Model *m, const char *snap, int cap, int bits,
+         size_t expected_size = (size_t)c->n_layers * c->n_experts;
+         if (fread(m->is_pinned, 1, expected_size, pinf) == expected_size) {
+             m->hot_pinned = 1;
+-            printf("[HOT] Loaded persistent pinning from %s\n", pinpath);
++            fprintf(stderr, "[HOT] Loaded persistent pinning from %s\n", pinpath);
+             
+             if (g_pilot) {
+                 ensure_pilot_worker_started(m);
+@@ -647,7 +647,7 @@ static void model_init_range(Model *m, const char *snap, int cap, int bits,
+                         }
+                     }
+                 }
+-                printf("[HOT] Pre-loading pinned experts into cache...\n");
++                fprintf(stderr, "[HOT] Pre-loading pinned experts into cache...\n");
+                 double t_wait = now_s();
+                 while (1) {
+                     unsigned r = __atomic_load_n(&pilot_r, __ATOMIC_ACQUIRE);
+@@ -655,7 +655,7 @@ static void model_init_range(Model *m, const char *snap, int cap, int bits,
+                     if (r == w) break;
+                     sleep_ms(2);
+                 }
+-                printf("[HOT] Pre-loaded in %.1fs!\n", now_s() - t_wait);
++                fprintf(stderr, "[HOT] Pre-loaded in %.1fs!\n", now_s() - t_wait);
+             }
+         }
+         fclose(pinf);
+@@ -878,10 +878,10 @@ static void pin_hot_experts(Model *m) {
+         }
+     }
+     if (is_dynamic) {
+-        printf("[HOT] Dynamic Pinned %d experts total (thresh=%.1f%%) after %d warmup tokens\n",
++        fprintf(stderr, "[HOT] Dynamic Pinned %d experts total (thresh=%.1f%%) after %d warmup tokens\n",
+                pinned_total, thresh * 100.0, m->freq_token_count);
+     } else {
+-        printf("[HOT] Pinned %d experts (top-%d/layer) after %d warmup tokens\n",
++        fprintf(stderr, "[HOT] Pinned %d experts (top-%d/layer) after %d warmup tokens\n",
+                pinned_total, m->hot_n, m->freq_token_count);
+     }
+ }
+@@ -1997,7 +1997,7 @@ int main(int argc, char **argv) {
+                 size_t expected_size = (size_t)m.c.n_layers * m.c.n_experts;
+                 fwrite(m.is_pinned, 1, expected_size, pinf_save);
+                 fclose(pinf_save);
+-                printf("[HOT] Saved persistent pinning to %s\n", pinpath);
++                fprintf(stderr, "[HOT] Saved persistent pinning to %s\n", pinpath);
+             }
+         } else {
+             fclose(pinf_chk);

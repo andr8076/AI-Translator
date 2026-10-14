@@ -14,13 +14,22 @@ import urllib.request
 import zipfile
 from pathlib import Path
 
+from translategemma_backend import TranslateGemmaServer
+
 ROOT = Path(__file__).resolve().parent
 DEFAULT_COLI = ROOT / ".runtime" / "colibri" / "c" / "coli"
 DEFAULT_MODEL = ROOT / ".models" / "olmoe_i8"
+DEFAULT_LLAMA = ROOT / ".runtime" / "llama" / "bin" / "llama"
+DEFAULT_TRANSLATEGEMMA_MODEL = (
+    ROOT / ".models" / "translategemma4b_q6" / "translategemma-4b-it.Q6_K.gguf"
+)
 DEFAULT_MODEL_ID = "olmoe-colibri"
 DEFAULT_KEY = "ai-translator-local"
 
-TIME_RE = re.compile(r"^\s*\d{1,2}:\d{2}:\d{2}[,.]\d{3}\s+-->\s+")
+TIME_RE = re.compile(
+    r"^\s*\d{1,3}:\d{2}:\d{2}[,.]\d{3}\s+-->\s+"
+    r"\d{1,3}:\d{2}:\d{2}[,.]\d{3}(?:\s+.*)?$"
+)
 MARKER_RE = re.compile(
     r"@@\s*(\d{1,3})\s*@@\s*\n(.*?)(?=\n@@\s*\d{1,3}\s*@@|\Z)", re.S
 )
@@ -48,18 +57,42 @@ def subtitle_text(cues):
 def parse_srt(raw):
     newline = "\r\n" if "\r\n" in raw else "\n"
     text = raw.replace("\r\n", "\n").replace("\r", "\n")
+    if not text.strip():
+        raise ValueError("Subtitle file is empty")
     blocks = re.split(r"\n{2,}", text.strip("\n"))
     cues = []
-    for block in blocks:
+    for number, block in enumerate(blocks, 1):
         lines = block.split("\n")
-        if len(lines) >= 3 and TIME_RE.match(lines[1]):
-            cues.append({"head": lines[:2], "body": lines[2:]})
+        if len(lines) < 3:
+            raise ValueError("Malformed SRT cue %d: expected number, timestamp, and text" % number)
+        if not lines[0].strip().isdigit():
+            raise ValueError("Malformed SRT cue %d: invalid subtitle number" % number)
+        if not TIME_RE.match(lines[1]):
+            raise ValueError("Malformed SRT cue %d: invalid timestamp" % number)
+        if not any(line.strip() for line in lines[2:]):
+            raise ValueError("Malformed SRT cue %d: empty subtitle text" % number)
+        cues.append({"head": lines[:2], "body": lines[2:]})
+    if not cues:
+        raise ValueError("No subtitle cues found")
     return cues, newline
 
 
 def render_srt(cues, newline):
     blocks = ["\n".join(c["head"] + c["body"]) for c in cues]
     return (("\n\n".join(blocks) + "\n") if blocks else "").replace("\n", newline)
+
+
+def validate_srt_layout(expected, actual):
+    if len(expected) != len(actual):
+        raise RuntimeError(
+            "SRT cue count changed: expected %d, got %d" %
+            (len(expected), len(actual))
+        )
+    for index, (before, after) in enumerate(zip(expected, actual), 1):
+        if before["head"] != after["head"]:
+            raise RuntimeError(
+                "SRT numbering/timestamp changed at cue %d" % index
+            )
 
 
 def write_state(path, state):
@@ -285,11 +318,36 @@ class SubtitleTranslator:
             return [dict(cue, body=list(cue["body"])) for cue in cues]
 
         prompt = self.prompt(cues, source, target, before, after)
+        if hasattr(self.server, "translate"):
+            context_before = "\n".join(
+                " ".join(cue["body"]) for cue in before
+            )
+            context_after = "\n".join(
+                " ".join(cue["body"]) for cue in after
+            )
+            prompt = (
+                "Translate only the target subtitle cues from %s into natural %s. "
+                "Use the surrounding dialogue to understand meaning, speakers, "
+                "and pronouns. Preserve the original question words and subject roles; "
+                "do not change who is acting or what the question asks about. "
+                "The context is for reference only; do not translate it. "
+                "Preserve every @@number@@ marker exactly and return only the "
+                "marked target translations.\n\n"
+                "Context before (reference only):\n%s\n\n"
+                "Context after (reference only):\n%s\n\n"
+                "Target cues (translate only):\n%s"
+            ) % (
+                source, target, context_before or "[none]",
+                context_after or "[none]", prompt,
+            )
         cue_text = " ".join(
             " ".join(cues[i]["body"]) for i in sorted(active)
         )
         source_words = len(re.findall(r"\S+", cue_text))
-        max_tokens = min(512, max(32, source_words * 3 + 16))
+        if hasattr(self.server, "translate"):
+            max_tokens = min(512, max(64, source_words * 6 + 32))
+        else:
+            max_tokens = min(512, max(32, source_words * 3 + 16))
         system = (
             "You are a strict subtitle translation engine. "
             "Translate from %s to natural, idiomatic %s. "
@@ -305,9 +363,14 @@ class SubtitleTranslator:
             "order, with translated subtitle text. Never output context, headings, "
             "instructions, explanations, END CUES, or REFERENCE text."
         ) % (source, target, source, target)
-        output = self.server.chat(
-            prompt, max_tokens=max_tokens, system=system
-        )
+        if hasattr(self.server, "translate"):
+            output = self.server.translate(
+                prompt, max_tokens, source, target
+            )
+        else:
+            output = self.server.chat(
+                prompt, max_tokens=max_tokens, system=system
+            )
         forbidden = (
             "END CUES", "REFERENCE BEFORE", "REFERENCE AFTER",
             "TRANSLATE THESE CUES", "Context before:", "Context after:",
@@ -315,7 +378,25 @@ class SubtitleTranslator:
         if any(token.lower() in output.lower() for token in forbidden):
             raise RuntimeError("Model echoed prompt scaffolding")
         matches = MARKER_RE.findall(output)
+        marker_numbers = [int(number) for number, _ in matches]
+        duplicate_markers = len(marker_numbers) != len(set(marker_numbers))
         translated = {int(number): body.strip("\n ") for number, body in matches}
+        if duplicate_markers:
+            translated = {}
+        if (
+            (duplicate_markers or set(translated) != active or
+             any(not translated[i].strip() for i in active))
+            and hasattr(self.server, "translate")
+            and len(cues) == 1
+            and len(active) == 1
+        ):
+            only = next(iter(active))
+            plain_text = "\n".join(cues[only]["body"])
+            fallback = self.server.translate(
+                plain_text, max_tokens, source, target
+            ).strip()
+            if fallback:
+                translated = {only: fallback}
         if set(translated) != active or any(not translated[i].strip() for i in active):
             missing = sorted(active - set(translated))[:12]
             raise RuntimeError(
@@ -392,7 +473,10 @@ def translate_srt(raw, start, limit, translator, source, target, state,
                 % (label, pos - len(translated) + 1, pos, len(cues), done / elapsed),
                 flush=True,
             )
-    return render_srt(cues, newline).encode("utf-8"), done
+    rendered = render_srt(cues, newline).encode("utf-8")
+    rendered_cues, _ = parse_srt(rendered.decode("utf-8"))
+    validate_srt_layout(cues, rendered_cues)
+    return rendered, done
 
 
 def process_srt_file(src, out, args, translator, label=None):
@@ -479,29 +563,48 @@ def process_zip(src, out, args, translator):
                     if len(saved_infos) == len(infos):
                         payloads = [archive.read(info) for info in saved_infos]
                         state.update(old)
+                        partial = state.get("partial_output")
+                        if isinstance(partial, str):
+                            entry = state.get("entry", 0)
+                            if 0 <= entry < len(payloads):
+                                payloads[entry] = partial.encode("utf-8")
                         print("[RESUME] ZIP entry", state["entry"] + 1, flush=True)
         except Exception as exc:
             print("[WARN] Ignoring invalid ZIP resume data:", exc, flush=True)
+    if not out.exists():
+        out.parent.mkdir(parents=True, exist_ok=True)
+        write_zip(out, infos, payloads)
     for index in range(state["entry"], len(infos)):
         info = infos[index]
         if not info.filename.lower().endswith(".srt"):
             state["entry"], state["next_cue"] = index + 1, 0
+            write_state(state_path, state)
             continue
+
+        def save_zip_checkpoint(partial_output, current_state):
+            current_state["partial_output"] = partial_output.decode("utf-8")
+            write_state(state_path, current_state)
+
         payloads[index], count = translate_srt(
             payloads[index], state["next_cue"], args.limit, translator,
             args.source_language, args.target_language, state,
             info.filename, args.block_cues, args.quiet,
+            checkpoint=save_zip_checkpoint,
         )
         complete = state["next_cue"] >= state["cue_total"]
         state["entry"] = index + 1 if complete else index
         if complete:
             state["next_cue"] = 0
+            state.pop("partial_output", None)
         out.parent.mkdir(parents=True, exist_ok=True)
         write_zip(out, infos, payloads)
         write_state(state_path, state)
         print("[CHECKPOINT]", info.filename, "| added", count, "cues", flush=True)
         if args.limit and count >= args.limit:
             break
+    if not out.exists():
+        out.parent.mkdir(parents=True, exist_ok=True)
+        write_zip(out, infos, payloads)
     print("[DONE] ZIP:", out, flush=True)
 
 
@@ -569,22 +672,40 @@ def colibri_doctor(coli_bin, model, context, ram_gb, cap, gpu):
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Translate SRT files, folders, or ZIPs with Colibrì."
+        description=(
+            "Translate SRT files, folders, or ZIPs with local TranslateGemma "
+            "(default) or Colibrì."
+        )
     )
     parser.add_argument("input")
     parser.add_argument("-o", "--output")
+    parser.add_argument(
+        "--backend", choices=("translategemma", "colibri"),
+        default="translategemma",
+        help="Translation engine (default: translategemma)",
+    )
+    parser.add_argument("--llama-bin", default=str(DEFAULT_LLAMA))
+    parser.add_argument(
+        "--gguf-model", default=str(DEFAULT_TRANSLATEGEMMA_MODEL)
+    )
+    parser.add_argument(
+        "--device", default="cpu",
+        help="cpu (default), auto, or an available llama.cpp device such as Vulkan0",
+    )
+    parser.add_argument("--gpu-layers", default="all")
+    parser.add_argument("--threads", type=int, default=4)
     parser.add_argument("--model", default=str(DEFAULT_MODEL))
     parser.add_argument("--coli-bin", default=str(DEFAULT_COLI))
     parser.add_argument("--source-language", default="English")
     parser.add_argument("--target-language", default="Danish")
-    parser.add_argument("--block-cues", type=int, default=8)
+    parser.add_argument("--block-cues", type=int, default=0)
     parser.add_argument("--limit", type=int, default=0)
-    parser.add_argument("--suffix", default="_colibri_da")
+    parser.add_argument("--suffix")
     parser.add_argument("--fresh", action="store_true")
     parser.add_argument("--quiet", action="store_true")
     parser.add_argument("--allow-sleep", action="store_true")
     parser.add_argument("--port", type=int, default=8768)
-    parser.add_argument("--context-size", type=int, default=4096)
+    parser.add_argument("--context-size", type=int, default=0)
     parser.add_argument("--ram-gb", type=int, default=0)
     parser.add_argument("--cap", type=int, default=0)
     parser.add_argument("--gpu", default="none")
@@ -592,8 +713,24 @@ def main():
     parser.add_argument("--model-id", default=DEFAULT_MODEL_ID)
     args = parser.parse_args()
 
+    if args.context_size == 0:
+        args.context_size = 2048 if args.backend == "translategemma" else 4096
+    if args.block_cues == 0:
+        args.block_cues = 16 if args.backend == "translategemma" else 8
+    if args.suffix is None:
+        args.suffix = (
+            "_translategemma_da"
+            if args.backend == "translategemma"
+            else "_colibri_da"
+        )
     if args.block_cues < 1:
         parser.error("--block-cues must be at least 1")
+    if args.context_size < 1:
+        parser.error("--context-size must be at least 1")
+    if args.backend == "translategemma" and args.context_size > 2048:
+        parser.error("TranslateGemma supports at most 2048 context tokens")
+    if args.threads < 1:
+        parser.error("--threads must be at least 1")
     if args.cap < 0:
         parser.error("--cap cannot be negative")
     if args.suffix and not args.suffix.startswith(("_", "-", ".")):
@@ -601,19 +738,8 @@ def main():
 
     args.coli_bin = str(Path(args.coli_bin).expanduser().resolve())
     args.model = str(Path(args.model).expanduser().resolve())
-    maybe_setup(args)
-    if not Path(args.coli_bin).is_file():
-        parser.error(
-            "Colibri runtime is missing. Run: ./setup_colibri.sh --runtime"
-        )
-    if not (
-        Path(args.model).is_dir()
-        and (Path(args.model) / "config.json").is_file()
-        and any(Path(args.model).glob("*.safetensors"))
-    ):
-        parser.error(
-            "Colibri model is missing. Run: ./setup_colibri.sh --install-model"
-        )
+    args.llama_bin = str(Path(args.llama_bin).expanduser().resolve())
+    args.gguf_model = str(Path(args.gguf_model).expanduser().resolve())
 
     src = Path(args.input).expanduser().resolve()
     if not src.exists():
@@ -631,21 +757,81 @@ def main():
         out = src.with_name(src.stem + args.suffix + src.suffix)
 
     sleep_inhibitor = None
+    server = None
     if not args.allow_sleep:
         sleep_inhibitor = start_sleep_inhibitor()
-    key = os.environ.get("COLIBRI_TRANSLATOR_API_KEY", DEFAULT_KEY)
-    print("[COLIBRI] Preflight check...", flush=True)
-    colibri_doctor(
-        args.coli_bin, args.model, args.context_size, args.ram_gb,
-        args.cap, args.gpu,
-    )
-    server = ColibriServer(
-        args.coli_bin, args.model, args.model_id, key, args.port,
-        args.context_size, args.ram_gb, args.cap, args.gpu,
-        ROOT / ".runtime" / "colibri-translator.log",
-        args.startup_timeout,
-    )
+
     try:
+        if args.backend == "translategemma":
+            setup = ROOT / "setup_translategemma.sh"
+            if (
+                not Path(args.llama_bin).is_file()
+                or not os.access(args.llama_bin, os.X_OK)
+            ) and setup.is_file():
+                print(
+                    "[SETUP] llama.cpp runtime missing; installing it locally...",
+                    flush=True,
+                )
+                subprocess.run(["bash", str(setup), "--runtime"], check=True)
+            if (
+                not Path(args.llama_bin).is_file()
+                or not os.access(args.llama_bin, os.X_OK)
+            ):
+                parser.error(
+                    "llama.cpp runtime is missing. Run: "
+                    "./setup_translategemma.sh --runtime"
+                )
+            if not Path(args.gguf_model).is_file():
+                parser.error(
+                    "TranslateGemma model is missing. Run: "
+                    "./setup_translategemma.sh --install-model"
+                )
+            key = os.environ.get(
+                "TRANSLATEGEMMA_API_KEY",
+                os.environ.get("COLIBRI_TRANSLATOR_API_KEY", DEFAULT_KEY),
+            )
+            print(
+                "[TRANSLATEGEMMA] Preflight check | model:",
+                args.gguf_model,
+                "| threads:", args.threads,
+                "| context:", args.context_size,
+                flush=True,
+            )
+            server = TranslateGemmaServer(
+                args.llama_bin, args.gguf_model, key, args.port,
+                args.context_size, args.threads,
+                ROOT / ".runtime" / "translategemma.log",
+                args.startup_timeout, device=args.device,
+                gpu_layers=args.gpu_layers,
+            )
+        else:
+            maybe_setup(args)
+            if not Path(args.coli_bin).is_file():
+                parser.error(
+                    "Colibri runtime is missing. Run: ./setup_colibri.sh --runtime"
+                )
+            if not (
+                Path(args.model).is_dir()
+                and (Path(args.model) / "config.json").is_file()
+                and any(Path(args.model).glob("*.safetensors"))
+            ):
+                parser.error(
+                    "Colibri model is missing. Run: "
+                    "./setup_colibri.sh --install-model"
+                )
+            key = os.environ.get("COLIBRI_TRANSLATOR_API_KEY", DEFAULT_KEY)
+            print("[COLIBRI] Preflight check...", flush=True)
+            colibri_doctor(
+                args.coli_bin, args.model, args.context_size, args.ram_gb,
+                args.cap, args.gpu,
+            )
+            server = ColibriServer(
+                args.coli_bin, args.model, args.model_id, key, args.port,
+                args.context_size, args.ram_gb, args.cap, args.gpu,
+                ROOT / ".runtime" / "colibri-translator.log",
+                args.startup_timeout,
+            )
+
         server.start()
         translator = SubtitleTranslator(server)
         if src.is_dir():
@@ -655,7 +841,8 @@ def main():
         else:
             process_srt_file(src, out, args, translator)
     finally:
-        server.stop()
+        if server is not None:
+            server.stop()
         stop_sleep_inhibitor(sleep_inhibitor)
 
 

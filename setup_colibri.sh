@@ -55,12 +55,28 @@ model_ok() {
 install_runtime() {
     mkdir -p "$(dirname "$RUNTIME_DIR")"
     if [[ -d "$RUNTIME_DIR/.git" ]]; then
-        echo "[SETUP] Updating Colibrì runtime..."
-        git -C "$RUNTIME_DIR" pull --ff-only
+        if [[ -n "$(git -C "$RUNTIME_DIR" status --porcelain)" ]]; then
+            echo "[SETUP] Keeping the existing local Colibrì runtime changes."
+        else
+            echo "[SETUP] Updating Colibrì runtime..."
+            git -C "$RUNTIME_DIR" pull --ff-only
+        fi
     else
         echo "[SETUP] Cloning Colibrì runtime..."
         rm -rf "$RUNTIME_DIR"
         git clone --depth 1 "$UPSTREAM" "$RUNTIME_DIR"
+    fi
+    local serve_patch="$ROOT/patches/colibri-olmoe-hot-stdout.patch"
+    if [[ -f "$serve_patch" ]]; then
+        if git -C "$RUNTIME_DIR" apply --check "$serve_patch" >/dev/null 2>&1; then
+            echo "[SETUP] Routing OLMoE hot-pin logs to stderr..."
+            git -C "$RUNTIME_DIR" apply "$serve_patch"
+        elif git -C "$RUNTIME_DIR" apply --reverse --check "$serve_patch" >/dev/null 2>&1; then
+            echo "[SETUP] OLMoE hot-pin log patch is already applied."
+        else
+            echo "[SETUP] Could not apply the OLMoE hot-pin log patch cleanly." >&2
+            exit 2
+        fi
     fi
     echo "[SETUP] Building OLMoE engine..."
     make -C "$RUNTIME_DIR/c" olmoe

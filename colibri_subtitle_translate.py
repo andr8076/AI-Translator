@@ -67,8 +67,8 @@ def load_glossary(path):
             raise ValueError("Glossary line is too long: " + line[:80])
         entries.append(line)
         total_chars += len(line)
-    if len(entries) > 100 or total_chars > 8000:
-        raise ValueError("Glossary is too large; use at most 100 lines / 8000 characters")
+    if len(entries) > 120 or total_chars > 8000:
+        raise ValueError("Glossary is too large; use at most 120 lines / 8000 characters")
     return tuple(entries)
 
 

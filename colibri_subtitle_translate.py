@@ -67,8 +67,8 @@ def load_glossary(path):
             raise ValueError("Glossary line is too long: " + line[:80])
         entries.append(line)
         total_chars += len(line)
-    if len(entries) > 80 or total_chars > 8000:
-        raise ValueError("Glossary is too large; use at most 80 lines / 8000 characters")
+    if len(entries) > 100 or total_chars > 8000:
+        raise ValueError("Glossary is too large; use at most 100 lines / 8000 characters")
     return tuple(entries)
 
 
@@ -325,7 +325,7 @@ class SubtitleTranslator:
                 )
             source_text, target_text = mapping.split("=>", 1)
             source_text = " ".join(source_text.split()).strip()
-            target_text = target_text.strip()
+            target_text = target_text.replace("\\n", "\n").strip()
             if not source_text or not target_text:
                 raise ValueError("EXACT glossary entry cannot be empty: " + entry)
             self.exact_overrides.append(

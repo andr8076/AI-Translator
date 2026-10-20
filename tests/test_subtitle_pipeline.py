@@ -196,6 +196,50 @@ class SubtitlePipelineTests(unittest.TestCase):
         ))
         self.assertFalse(app.looks_danish("This is an English subtitle sentence."))
 
+    def test_linguistic_stage_directions_are_translated(self):
+        stage, _ = app.parse_srt(
+            "1\n00:00:01,000 --> 00:00:02,000\n[Birds chirping]\n"
+        )
+        symbols, _ = app.parse_srt(
+            "1\n00:00:01,000 --> 00:00:02,000\n[♪♪]\n"
+        )
+        self.assertFalse(app.SubtitleTranslator.passthrough(stage[0]))
+        self.assertTrue(app.SubtitleTranslator.passthrough(symbols[0]))
+
+    def test_glossary_is_bounded_and_added_to_prompt(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "glossary.txt"
+            path.write_text(
+                "# comment\nWalnut Grove => Valnøddal\n"
+                "EXACT: Jeremy, how old are you? => Jeremy, hvor gammel er du?\n",
+                encoding="utf-8",
+            )
+            glossary = app.load_glossary(path)
+        self.assertEqual(
+            glossary,
+            (
+                "Walnut Grove => Valnøddal",
+                "EXACT: Jeremy, how old are you? => Jeremy, hvor gammel er du?",
+            ),
+        )
+        server = TranslateGemmaMarkerServer()
+        translator = app.SubtitleTranslator(server, glossary=glossary)
+        cues, _ = app.parse_srt(RAW)
+        translator.translate_chunk(cues[:1], "English", "Danish")
+        prompt = server.calls[0][0]
+        self.assertIn("Walnut Grove => Valnøddal", prompt)
+        self.assertIn("hvor gammel er du", prompt)
+
+        exact_cues, _ = app.parse_srt(
+            "1\n00:00:01,000 --> 00:00:02,000\nJeremy, how old are you?\n"
+        )
+        exact_result = translator.translate_chunk(
+            exact_cues, "English", "Danish"
+        )
+        self.assertEqual(
+            exact_result[0]["body"], ["Jeremy, hvor gammel er du?"]
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

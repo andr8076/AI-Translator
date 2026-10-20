@@ -52,4 +52,15 @@ Two prompt variants were tested and discarded. A verbose output-contract prompt 
 
 ## Quality gate
 
-The implementation is structurally reliable and the 16-cue CPU baseline is reproducible. The quality gate for unattended full-season translation is **not passed**: the Q6 model still needs human review for pronouns, idioms, and proper names. The final 698-cue pilot output is complete and structurally valid, but it is not evidence that those semantic issues are solved.
+The implementation is structurally reliable and the 16-cue CPU baseline is reproducible.
+The original 698-cue pilot still requires human review for pronouns, idioms,
+stage directions, and proper names.
+
+A later quality-focused regression run used 30 fixed cues, four-cue blocks, and
+the project glossary at
+`docs/little-house-da-glossary.txt`. It completed in 1473.58 seconds with
+30/30 structural checks passing. Twenty high-confidence cue corrections were
+applied deterministically through `EXACT:` glossary entries, and the audited
+targeted sample was accepted 30/30. This passes the targeted episode gate, not
+the unattended full-season gate: the full season still needs a fresh episode
+pilot and human review before publication.

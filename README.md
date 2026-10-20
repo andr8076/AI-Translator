@@ -42,6 +42,20 @@ python3 colibri_subtitle_translate.py \
 
 The default TranslateGemma settings already select Q6, CPU, a 2048-token context, and 16-cue blocks. Use `--device auto` only when a supported llama.cpp accelerator has been independently verified; CPU is the reproducible Farm4 setting. Prompt KV caching is disabled by default on the 8 GB profile because a long cache-enabled run grew into swap pressure; use `--cache-prompt` only when extra RAM is available and the trade-off has been benchmarked. Long runs restart the inference server every 8 blocks (128 cues) by default to release accumulated allocator/KV memory; use `--restart-every 0` only when you have independently verified enough RAM.
 
+For a known series, pass a small UTF-8 glossary with established names and
+idioms. Lines beginning with `EXACT:` are deterministic cue-level overrides and
+are useful for high-confidence recurring lines:
+
+```bash
+python3 colibri_subtitle_translate.py \
+  "/path/to/episode.srt" --backend translategemma \
+  --glossary docs/little-house-da-glossary.txt
+```
+
+The glossary is bounded to 80 lines/4000 characters. Linguistic bracketed
+stage directions are translated; purely symbolic markers such as `[♪♪]` stay
+unchanged.
+
 Translate a directory (the output is a sibling directory) or a ZIP:
 
 ```bash

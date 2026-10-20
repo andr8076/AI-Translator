@@ -50,6 +50,28 @@ def looks_danish(text):
     return hits >= 3 and (special >= 1 or hits / max(words, 1) >= 0.06)
 
 
+def load_glossary(path):
+    """Read a small project glossary without allowing unbounded prompt growth."""
+    if not path:
+        return ()
+    glossary_path = Path(path).expanduser().resolve()
+    if not glossary_path.is_file():
+        raise FileNotFoundError("Glossary does not exist: " + str(glossary_path))
+    entries = []
+    total_chars = 0
+    for raw_line in glossary_path.read_text(encoding="utf-8-sig").splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if len(line) > 240:
+            raise ValueError("Glossary line is too long: " + line[:80])
+        entries.append(line)
+        total_chars += len(line)
+    if len(entries) > 80 or total_chars > 4000:
+        raise ValueError("Glossary is too large; use at most 80 lines / 4000 characters")
+    return tuple(entries)
+
+
 def subtitle_text(cues):
     return "\n".join(" ".join(c["body"]) for c in cues)
 
@@ -289,13 +311,48 @@ class ColibriServer:
 
 
 class SubtitleTranslator:
-    def __init__(self, server):
+    def __init__(self, server, glossary=()):
         self.server = server
+        self.glossary = tuple(glossary)
+        self.exact_overrides = []
+        for entry in self.glossary:
+            if not entry.startswith("EXACT:"):
+                continue
+            mapping = entry[len("EXACT:"):].strip()
+            if "=>" not in mapping:
+                raise ValueError(
+                    "EXACT glossary entry must use 'source => target': " + entry
+                )
+            source_text, target_text = mapping.split("=>", 1)
+            source_text = " ".join(source_text.split()).strip()
+            target_text = target_text.strip()
+            if not source_text or not target_text:
+                raise ValueError("EXACT glossary entry cannot be empty: " + entry)
+            self.exact_overrides.append(
+                (" ".join(source_text.casefold().split()), target_text)
+            )
+
+    def apply_exact_overrides(self, cues, translated):
+        for index in range(len(cues)):
+            source_key = " ".join(
+                " ".join(cues[index]["body"]).casefold().split()
+            )
+            for exact_source, exact_target in self.exact_overrides:
+                if source_key == exact_source:
+                    translated[index] = exact_target
+                    break
+        return translated
 
     @staticmethod
     def passthrough(cue):
         text = "\n".join(cue["body"]).strip()
-        return bool(re.fullmatch(r"(?:\[[^\n]*\]|\([^\n]*\))", text))
+        # Bracketed/parenthetical cues are usually stage directions and must be
+        # translated (for example, "[Birds chirping]" -> "[Fugle kvidrer]").
+        # Keep only genuinely non-linguistic markers such as "[♪♪]" as-is.
+        return bool(
+            re.fullmatch(r"(?:\[[^\n]*\]|\([^\n]*\))", text)
+            and not re.search(r"[A-Za-zÆØÅæøå]", text)
+        )
 
     @staticmethod
     def prompt(cues, source, target, before=(), after=()):
@@ -318,6 +375,25 @@ class SubtitleTranslator:
             return [dict(cue, body=list(cue["body"])) for cue in cues]
 
         prompt = self.prompt(cues, source, target, before, after)
+        glossary = "\n".join(self.glossary).strip()
+        glossary_block = (
+            "Project glossary and translation notes (use only when relevant):\n"
+            + glossary + "\n\n"
+            if glossary else ""
+        )
+        quality_rules = (
+            "Use natural, idiomatic %s rather than word-for-word calques. "
+            "Keep question words, negation, tense, speaker roles, and names exact. "
+            "Translate ordinary words inside bracketed or parenthetical stage "
+            "directions, while preserving the brackets. "
+            "For Danish, use normal forms such as 'hvor gammel er du' for "
+            "'how old are you'; do not invent comparative forms such as "
+            "'hvor ældre er du'. Interpret idioms by meaning, not by translating "
+            "individual words. "
+        ) % target
+        target_prompt = prompt
+        if not hasattr(self.server, "translate"):
+            target_prompt = glossary_block + prompt
         if hasattr(self.server, "translate"):
             context_before = "\n".join(
                 " ".join(cue["body"]) for cue in before
@@ -327,18 +403,19 @@ class SubtitleTranslator:
             )
             prompt = (
                 "Translate only the target subtitle cues from %s into natural %s. "
+                "%s"
                 "Use the surrounding dialogue to understand meaning, speakers, "
-                "and pronouns. Preserve the original question words and subject roles; "
-                "do not change who is acting or what the question asks about. "
-                "The context is for reference only; do not translate it. "
+                "and pronouns. The context is for reference only; do not translate it. "
                 "Preserve every @@number@@ marker exactly and return only the "
                 "marked target translations.\n\n"
+                "%s"
                 "Context before (reference only):\n%s\n\n"
                 "Context after (reference only):\n%s\n\n"
                 "Target cues (translate only):\n%s"
             ) % (
-                source, target, context_before or "[none]",
-                context_after or "[none]", prompt,
+                source, target, quality_rules, glossary_block,
+                context_before or "[none]", context_after or "[none]",
+                target_prompt,
             )
         cue_text = " ".join(
             " ".join(cues[i]["body"]) for i in sorted(active)
@@ -403,6 +480,7 @@ class SubtitleTranslator:
                 "Malformed structured translation: returned %d/%d cues; missing %s"
                 % (len(translated), len(active), missing)
             )
+        self.apply_exact_overrides(cues, translated)
         result = []
         for i, cue in enumerate(cues):
             if i in active:
@@ -717,6 +795,10 @@ def main():
     parser.add_argument("--coli-bin", default=str(DEFAULT_COLI))
     parser.add_argument("--source-language", default="English")
     parser.add_argument("--target-language", default="Danish")
+    parser.add_argument(
+        "--glossary",
+        help="Optional UTF-8 glossary/notes file included in every translation prompt",
+    )
     parser.add_argument("--block-cues", type=int, default=0)
     parser.add_argument("--limit", type=int, default=0)
     parser.add_argument("--suffix")
@@ -731,6 +813,11 @@ def main():
     parser.add_argument("--startup-timeout", type=int, default=300)
     parser.add_argument("--model-id", default=DEFAULT_MODEL_ID)
     args = parser.parse_args()
+
+    try:
+        args.glossary_entries = load_glossary(args.glossary)
+    except (OSError, ValueError) as exc:
+        parser.error(str(exc))
 
     if args.context_size == 0:
         args.context_size = 2048 if args.backend == "translategemma" else 4096
@@ -857,7 +944,7 @@ def main():
             )
 
         server.start()
-        translator = SubtitleTranslator(server)
+        translator = SubtitleTranslator(server, glossary=args.glossary_entries)
         if src.is_dir():
             process_folder(src, out, args, translator)
         elif src.suffix.lower() == ".zip":

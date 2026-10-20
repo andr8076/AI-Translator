@@ -1,0 +1,39 @@
+# Little House on the Prairie — established Danish terms and notes
+# Lines are inserted into the model prompt; apply only when the context matches.
+Walnut Grove => Valnøddal
+Half-Pint => Lille Laura
+Meadowlark => stær
+blind school => blindeskolen
+“meet your stage” means “leve op til dine forventninger” when it is used idiomatically.
+“high time” should be translated by its meaning (often “det er længe siden”), not literally as “høj tid”.
+“holding out hope” means “holde fast i håbet” or “give håb”, depending on the speaker and sentence.
+Bracketed stage directions such as [Birds chirping] and [Sighs] are translated into Danish while the brackets are retained.
+“How old are you?” => “Hvor gammel er du?”; never use “hvor ældre er du” for an age question.
+“I know, don’t apologize.” => “Jeg ved det, du behøver ikke undskylde.”
+“combed his hair” => “kæmmede sit hår”; do not translate “combed” as “kæmpede”.
+“wagon wheel” in the song is naturally “et hjul” in this subtitle context.
+
+# High-confidence corrections for S09E10 (source cue text => approved Danish cue text).
+EXACT: Mama, what's that lady Looking at? => Mor, hvad kigger den dame på?
+EXACT: Jeremy, how Old Are you? => Jeremy, hvor gammel er du?
+EXACT: I know, don't apologize. => Jeg ved det, du behøver ikke undskylde.
+EXACT: Jane: Walnut grove. => Jane: Til valnøddal.
+EXACT: I went to the blind school some Years ago => Jeg gik på blindeskolen for nogle år siden.
+EXACT: I find most of laura's letters Are about you. => Jeg opdager, at mange af Lauras breve handler om dig.
+EXACT: It's high Time we met you. => Det er længe siden, vi har mødt dig.
+EXACT: Half-Pint. => Lille Laura.
+EXACT: I Was delighted to hear you were visiting, I Hope you'll make It permanent. => Jeg blev meget glad for at høre, at I er på besøg, og jeg håber, at I bliver her permanent.
+EXACT: Oh, nary a One. Clear as a bell. => Nej, slet ingen. Krystalklart.
+EXACT: [Slow waltz playing] => [Langsom vals spiller]
+EXACT: Throw In a plug of this tobacco. => Så lægger du lige en pose af den her tobak med.
+EXACT: [Birds chirping] => [Fugle kvidrer]
+EXACT: Meadowlark. => En stær.
+EXACT: "I'm taking the liberty of writing you => "Jeg tager mig friheden til at skrive til dig
+EXACT: "It is my profound Hope that you Will decide In favor of the surgery => "Det er mit dybeste håb, at du vil beslutte dig for at få operationen
+EXACT: He's holding out-- holding out Hope, Jane, => Han giver dig-- han holder fast i et håb, Jane,
+EXACT: Now, you Mark my words. => Lyt godt efter, Mark, jeg siger det.
+EXACT: pretend like It doesn't exist? => skal jeg bare lade som om det ikke findes?
+EXACT: go ahead. => Fortsæt.
+EXACT: for that to be all right. => og acceptere det.
+EXACT: I'm sorry I didn't meet your stage, you know, But, uh... => Jeg er ked af, at jeg ikke levede op til dine forventninger, ved du... Men...
+EXACT: ♪ Combed his hair with a wagon wheel... ♪ => ♪ Han kæmmede sit hår med et hjul... ♪

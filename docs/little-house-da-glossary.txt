@@ -37,3 +37,5 @@ EXACT: go ahead. => Fortsæt.
 EXACT: for that to be all right. => og acceptere det.
 EXACT: I'm sorry I didn't meet your stage, you know, But, uh... => Jeg er ked af, at jeg ikke levede op til dine forventninger, ved du... Men...
 EXACT: ♪ Combed his hair with a wagon wheel... ♪ => ♪ Han kæmmede sit hår med et hjul... ♪
+EXACT: Hush now, Jeremy. Don't ask questions. => Shh, Jeremy. Spørg ikke om alt.
+EXACT: ask so many questions. => stiller så mange spørgsmål.

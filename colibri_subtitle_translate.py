@@ -374,6 +374,27 @@ class SubtitleTranslator:
         if not active:
             return [dict(cue, body=list(cue["body"])) for cue in cues]
 
+        exact = {}
+        for index in active:
+            source_key = " ".join(
+                " ".join(cues[index]["body"]).casefold().split()
+            )
+            for exact_source, exact_target in self.exact_overrides:
+                if source_key == exact_source:
+                    exact[index] = exact_target
+                    break
+        # If every active cue is covered by an exact project mapping, avoid
+        # spending a model request on text that is already quality-approved.
+        if exact and len(exact) == len(active):
+            return [
+                dict(
+                    cue,
+                    body=exact[i].split("\n") if i in exact
+                    else list(cue["body"]),
+                )
+                for i, cue in enumerate(cues)
+            ]
+
         prompt = self.prompt(cues, source, target, before, after)
         glossary = "\n".join(self.glossary).strip()
         glossary_block = (

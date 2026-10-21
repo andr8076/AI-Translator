@@ -228,7 +228,7 @@ class SubtitlePipelineTests(unittest.TestCase):
         translator.translate_chunk(cues[:1], "English", "Danish")
         prompt = server.calls[0][0]
         self.assertIn("Walnut Grove => Valnøddal", prompt)
-        self.assertIn("hvor gammel er du", prompt)
+        self.assertNotIn("EXACT:", prompt)
 
         exact_cues, _ = app.parse_srt(
             "1\n00:00:01,000 --> 00:00:02,000\nJeremy, how old are you?\n"

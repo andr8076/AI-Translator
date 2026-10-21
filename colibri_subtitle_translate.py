@@ -314,6 +314,12 @@ class SubtitleTranslator:
     def __init__(self, server, glossary=()):
         self.server = server
         self.glossary = tuple(glossary)
+        # Exact mappings are applied deterministically and do not belong in
+        # every model prompt; keeping them out preserves the context budget.
+        self.prompt_glossary = tuple(
+            entry for entry in self.glossary
+            if not entry.startswith("EXACT:")
+        )
         self.exact_overrides = []
         for entry in self.glossary:
             if not entry.startswith("EXACT:"):
@@ -396,7 +402,7 @@ class SubtitleTranslator:
             ]
 
         prompt = self.prompt(cues, source, target, before, after)
-        glossary = "\n".join(self.glossary).strip()
+        glossary = "\n".join(self.prompt_glossary).strip()
         glossary_block = (
             "Project glossary and translation notes (use only when relevant):\n"
             + glossary + "\n\n"
